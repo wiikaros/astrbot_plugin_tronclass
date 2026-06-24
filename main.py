@@ -4,7 +4,8 @@ import time
 import asyncio
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, AstrBotConfig
+from astrbot.api.star import Context, Star, register
+from astrbot.core import AstrBotConfig
 from astrbot.api import logger
 
 from config import (
