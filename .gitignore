@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+__init__.py
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AstrBot local data
+data/
+
+# Project-specific
+示例数据包/
+CLAUDE.md
+tests/
