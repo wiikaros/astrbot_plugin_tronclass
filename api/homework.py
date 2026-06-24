@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from api.auth import TronClassClient
+from .auth import TronClassClient
 
 
 async def fetch_homeworks(client: TronClassClient) -> List[dict]:

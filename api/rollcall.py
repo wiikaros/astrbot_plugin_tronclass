@@ -2,7 +2,7 @@
 
 from typing import List, Set
 
-from api.auth import TronClassClient
+from .auth import TronClassClient
 
 
 async def fetch_rollcalls(client: TronClassClient) -> List[dict]:

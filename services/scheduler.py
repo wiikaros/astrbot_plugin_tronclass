@@ -11,12 +11,12 @@ from typing import Optional, Set
 from astrbot.api import logger
 from astrbot.api.star import Context
 
-from api.auth import TronClassClient
-from api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
-from api.rollcall import fetch_rollcalls, detect_new_rollcalls
-from services.storage import StorageService
-from services.ics_parser import is_in_class_now
-from services.notifier import format_multiple_homework_notifications, format_new_rollcall
+from ..api.auth import TronClassClient
+from ..api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
+from ..api.rollcall import fetch_rollcalls, detect_new_rollcalls
+from .storage import StorageService
+from .ics_parser import is_in_class_now
+from .notifier import format_multiple_homework_notifications, format_new_rollcall
 
 
 class SchedulerService:
