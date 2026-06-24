@@ -1,0 +1,68 @@
+{
+    "school": {
+        "description": "畅课服务器配置",
+        "type": "object",
+        "items": {
+            "base_url": {
+                "description": "畅课服务器地址",
+                "type": "string",
+                "default": "https://courses.cuc.edu.cn"
+            },
+            "name": {
+                "description": "学校名称（仅用于展示）",
+                "type": "string",
+                "default": "中国传媒大学"
+            }
+        }
+    },
+    "homework_check_interval": {
+        "description": "作业定时检测间隔（分钟）",
+        "type": "int",
+        "default": 30,
+        "slider": {
+            "min": 10,
+            "max": 120,
+            "step": 5
+        }
+    },
+    "rollcall_default_interval": {
+        "description": "无课表时的点名检测间隔（分钟）",
+        "type": "int",
+        "default": 5,
+        "slider": {
+            "min": 1,
+            "max": 60,
+            "step": 1
+        }
+    },
+    "rollcall_class_precheck_minutes": {
+        "description": "上课前提前开始检测的分钟数",
+        "type": "int",
+        "default": 5,
+        "slider": {
+            "min": 0,
+            "max": 15,
+            "step": 1
+        }
+    },
+    "homework_due_warn_hours": {
+        "description": "作业快到期提醒阈值（小时）",
+        "type": "int",
+        "default": 24
+    },
+    "enable_new_homework_notify": {
+        "description": "新作业发布时推送通知",
+        "type": "bool",
+        "default": true
+    },
+    "enable_due_warning": {
+        "description": "作业快到期时推送提醒",
+        "type": "bool",
+        "default": true
+    },
+    "enable_rollcall_notify": {
+        "description": "新点名时推送通知",
+        "type": "bool",
+        "default": true
+    }
+}
