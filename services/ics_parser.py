@@ -6,7 +6,7 @@ from typing import Optional, Dict, List, Tuple
 import icalendar
 from astrbot.api import logger
 
-from config import ICS_DAYS_MAP
+from ..config import ICS_DAYS_MAP
 
 
 def parse_ics(content: str) -> Optional[dict]:

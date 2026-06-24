@@ -8,7 +8,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
 from astrbot.api import logger
 
-from config import (
+from .config import (
     LOGIN_STATE_TTL_SECONDS,
     MAX_LOGIN_ATTEMPTS_PER_HOUR,
     DEFAULT_BASE_URL,
@@ -17,17 +17,17 @@ from config import (
     DEFAULT_ROLLCALL_PRECHECK_MINUTES,
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
 )
-from api.auth import TronClassClient
-from api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
-from api.rollcall import fetch_rollcalls, detect_new_rollcalls
-from services.storage import StorageService
-from services.ics_parser import parse_ics
-from services.notifier import (
+from .api.auth import TronClassClient
+from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
+from .api.rollcall import fetch_rollcalls, detect_new_rollcalls
+from .services.storage import StorageService
+from .services.ics_parser import parse_ics
+from .services.notifier import (
     format_new_homework,
     format_due_warning,
     format_homework_summary,
 )
-from services.scheduler import SchedulerService
+from .services.scheduler import SchedulerService
 
 
 class TronClassPlugin(Star):
@@ -317,7 +317,7 @@ class TronClassPlugin(Star):
 
         try:
             # 重建 LoginState
-            from api.auth import LoginState
+            from .api.auth import LoginState
             state = LoginState(
                 username=login_state["username"],
                 password=login_state["password"],

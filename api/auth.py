@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import aiohttp
 from astrbot.api import logger
 
-from config import (
+from ..config import (
     KV_SESSION_PREFIX,
     LOGIN_STATE_TTL_SECONDS,
     ENDPOINT_TODOS,
