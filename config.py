@@ -23,6 +23,11 @@ DEFAULT_HOMEWORK_DUE_WARN_HOURS = 24   # 小时
 ENDPOINT_TODOS = "/api/todos"
 ENDPOINT_ROLLCALLS = "/api/radar/rollcalls"
 
+# ========== WeChat 登录 ==========
+WECHAT_POLL_URL = "https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}"
+WECHAT_POLL_INTERVAL = 2       # 轮询间隔（秒）
+WECHAT_POLL_TIMEOUT = 180      # 轮询超时（秒）
+
 # ========== ICS 相关 ==========
 ICS_DAYS_MAP = {
     "MO": 1, "TU": 2, "WE": 3, "TH": 4,

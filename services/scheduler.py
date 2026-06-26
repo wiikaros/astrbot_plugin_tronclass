@@ -4,14 +4,13 @@
 支持 ICS 课表驱动的智能点名检测。
 """
 
-import asyncio
 import time
-from typing import Optional, Set
+from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context
 
-from ..api.auth import TronClassClient
+from ..api.auth import TronClassClient, check_session_valid
 from ..api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from ..api.rollcall import fetch_rollcalls, detect_new_rollcalls
 from .storage import StorageService
@@ -93,11 +92,25 @@ class SchedulerService:
     # ========== 帮助方法 ==========
 
     async def _get_client_for_user(self, user_id: str) -> Optional[TronClassClient]:
-        """为用户创建已认证的 API 客户端。"""
+        """为用户创建已认证的 API 客户端，自动检查过期。"""
         session_data = await self._storage.get_session(user_id)
         if session_data is None:
             return None
-        return TronClassClient.from_session_data(session_data)
+        client = TronClassClient.from_session_data(session_data)
+        if not await check_session_valid(client):
+            logger.info(f"Session 已过期 [{user_id}]，清理并通知用户")
+            await self._storage.delete_session(user_id)
+            await client.close()
+            # 通知用户重新登录
+            try:
+                await self._send_private_notification(
+                    user_id,
+                    "⚠️ 你的畅课登录已过期，请重新发送 /微信登录 或 /登录畅课"
+                )
+            except Exception:
+                pass
+            return None
+        return client
 
     # ========== 作业检测 ==========
 
@@ -240,17 +253,12 @@ class SchedulerService:
 
     async def _should_check_rollcall_by_default(self, user_id: str) -> bool:
         """检查是否到达无课表时的默认点名检测间隔。"""
-        # 简化为：每分钟 Cron 触发，根据是否到达间隔决定
-        # 使用当前分钟数判断
         now = int(time.time())
         interval_seconds = self._rollcall_default_interval * 60
-
-        # 使用带用户粒度的分钟数对齐（不同用户分片检测）
-        key = f"_last_rollcall_check:{user_id}"
-        last_check = await self._storage._plugin.get_kv_data(key, default=0)
+        last_check = await self._storage.get_last_rollcall_time(user_id)
 
         if now - last_check >= interval_seconds:
-            await self._storage._plugin.put_kv_data(key, now)
+            await self._storage.set_last_rollcall_time(user_id, now)
             return True
 
         return False
@@ -258,26 +266,24 @@ class SchedulerService:
     # ========== 通知发送 ==========
 
     async def _send_private_notification(self, user_id: str, message: str):
-        """给指定用户发送私聊通知。
-
-        通过 AstrBot 的 platform_manager 直接发送私聊消息。
-        user_id 的格式取决于平台：
-        - QQ: 用户 QQ 号
-        - Telegram: 用户 Telegram ID
-        """
+        """给指定用户发送私聊通知。"""
         try:
-            # 通过 platform_manager 获取已激活的适配器并发送
-            adapters = self._context.platform_manager.get_adapters()
-            for adapter in adapters:
-                try:
-                    await adapter.send_private_message(user_id, message)
-                    return
-                except Exception:
-                    continue
+            pm = self._context.platform_manager
+            adapters = None
+            for attr in ("adapters", "get_adapters", "get_all_adapters", "_adapters"):
+                val = getattr(pm, attr, None)
+                if val is not None:
+                    adapters = val() if callable(val) else val
+                    break
 
-            logger.warning(
-                f"无法发送私聊消息 [{user_id}]：没有可用的平台适配器"
-            )
+            if adapters:
+                for adapter in adapters:
+                    try:
+                        await adapter.send_private_message(user_id, message)
+                        return
+                    except Exception:
+                        continue
+
+            logger.warning(f"无法发送私聊消息 [{user_id}]")
         except Exception as e:
             logger.error(f"发送私聊消息失败 [{user_id}]：{e}")
-            raise
