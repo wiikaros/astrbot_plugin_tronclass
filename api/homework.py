@@ -1,30 +1,56 @@
 """畅课作业 API 封装。"""
 
-from typing import List, Optional
+from typing import List
+from datetime import datetime, timedelta
 
 from .auth import TronClassClient
 
 
 async def fetch_homeworks(client: TronClassClient) -> List[dict]:
-    """获取最新作业列表。
+    """获取最新作业列表，从 homework-activities 补充截止时间和状态。
 
-    Args:
-        client: 已登录的 TronClassClient 实例。
-
-    Returns:
-        标准化后的作业列表，每项包含 id, title, course_name, due_at, status。
+    /api/todos 只返回 id/title/course，不含 due_at 和 status。
+    需要调 /api/courses/{course_id}/homework-activities 获取详情。
     """
-    raw = await client.get_todos()
+    todos = await client.get_todos()
+
+    # 收集所有涉及的 course_id，批量获取作业详情
+    course_ids = set()
+    for item in todos:
+        cid = item.get("course_id")
+        if cid:
+            course_ids.add(cid)
+
+    # 并行获取各课程的作业活动
+    from astrbot.api import logger as _logger
+    activities = {}
+    for cid in course_ids:
+        try:
+            acts = await client.get_homework_activities(cid)
+            _logger.info(f"course {cid}: {len(acts)} activities, keys={list(acts[0].keys()) if acts else 'EMPTY'}")
+            for act in acts:
+                activities[act.get("id")] = act
+        except Exception as e:
+            _logger.warning(f"course {cid} homework-activities 获取失败: {e}")
 
     homeworks = []
-    for item in raw:
+    for item in todos:
+        hw_id = item.get("id")
+        detail = activities.get(hw_id, {})
+
+        # homework-activities 的字段名: deadline, submitted_status
+        due_at = detail.get("deadline") or detail.get("end_time") or item.get("due_at", "")
+        status_raw = detail.get("submitted_status") or item.get("status", "")
+        if not status_raw and detail.get("submitted"):
+            status_raw = "已提交"
+
         hw = {
-            "id": item.get("id"),
+            "id": hw_id,
             "title": item.get("title", "未命名"),
             "course_name": item.get("course_name", ""),
             "course_id": item.get("course_id"),
-            "due_at": item.get("due_at", ""),
-            "status": item.get("status", "未知"),
+            "due_at": due_at,
+            "status": status_raw if status_raw else "未知",
             "type": item.get("type", ""),
         }
         homeworks.append(hw)
@@ -91,23 +117,14 @@ def get_imminent_due(
     homeworks: List[dict],
     warn_hours: int = 24,
 ) -> List[dict]:
-    """筛选快到期但未提交的作业。
-
-    Args:
-        homeworks: 作业列表。
-        warn_hours: 提前警告的小时数。
-
-    Returns:
-        快到期的作业列表。
-    """
-    from datetime import datetime, timedelta
+    """筛选快到期但未提交的作业。"""
+    from ._utils import parse_datetime
 
     now = datetime.now()
     threshold = now + timedelta(hours=warn_hours)
     imminent = []
 
     for hw in homeworks:
-        # 跳过已完成的
         status = hw.get("status", "")
         if status in ("已提交", "已完成", "submitted", "graded"):
             continue
@@ -116,28 +133,9 @@ def get_imminent_due(
         if not due_str:
             continue
 
-        try:
-            # 尝试多种日期格式
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%d",
-            ):
-                try:
-                    due_dt = datetime.strptime(due_str, fmt)
-                    break
-                except ValueError:
-                    continue
-            else:
-                continue
-
-            if now < due_dt <= threshold:
-                imminent.append(hw)
-        except Exception:
-            continue
+        due_dt = parse_datetime(due_str)
+        if due_dt and now < due_dt <= threshold:
+            imminent.append(hw)
 
     imminent.sort(key=lambda h: h.get("due_at", ""))
     return imminent

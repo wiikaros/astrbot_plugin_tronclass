@@ -1,6 +1,6 @@
 """畅课点名 API 封装。"""
 
-from typing import List, Set
+from typing import List
 
 from .auth import TronClassClient
 
@@ -36,7 +36,7 @@ async def fetch_rollcalls(client: TronClassClient) -> List[dict]:
 
 def detect_new_rollcalls(
     current: List[dict],
-    last_seen_ids: Set[int],
+    last_seen_ids: set,
 ) -> List[dict]:
     """检测新增的点名（与上次 ID 集合比对）。
 

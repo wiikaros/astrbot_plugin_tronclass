@@ -3,12 +3,14 @@
 import re
 import time
 import asyncio
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from dataclasses import dataclass, field
 
 import aiohttp
+from yarl import URL
 from astrbot.api import logger
 
+from ._utils import decode_jwt_expiry
 from ..config import (
     KV_SESSION_PREFIX,
     LOGIN_STATE_TTL_SECONDS,
@@ -26,9 +28,17 @@ class LoginState:
     captcha_type: str = ""       # "image" | "sms" | ""
     execution: str = ""          # CAS execution ID
     lt_token: str = ""           # CAS login ticket
-    login_url: str = ""          # CAS login POST URL
+    login_url: str = ""          # 当前要 POST 的登录 URL
     captcha_url: str = ""        # 验证码图片 URL（图片验证码时）
+    sms_action_url: str = ""     # 短信验证码表单的 action URL
+    sms_form_inputs: dict = None # 短信验证页面的 hidden input 字段
+    sms_captcha_field: str = ""  # 短信验证码输入框的 name
+    sms_trigger_url: str = ""    # 触发发送短信的 API 端点
     expires_at: float = 0.0
+
+    def __post_init__(self):
+        if self.sms_form_inputs is None:
+            self.sms_form_inputs = {}
 
 
 @dataclass
@@ -63,7 +73,7 @@ class TronClassClient:
                 for name, value in self._tron_session.cookies.items():
                     self._session.cookie_jar.update_cookies(
                         {name: value},
-                        aiohttp.URL(self.base_url),
+                        URL(self.base_url),
                     )
 
     async def close(self):
@@ -100,11 +110,6 @@ class TronClassClient:
         return client
 
     @property
-    def is_logged_in(self) -> bool:
-        """是否已登录。"""
-        return self._tron_session is not None and self._tron_session.session_id != ""
-
-    @property
     def is_expired(self) -> bool:
         """Session 是否已过期。"""
         if self._tron_session is None:
@@ -138,9 +143,9 @@ class TronClassClient:
             final_url = str(resp.url)
 
             # 如果直接登录成功了（已有有效 cookie，不常见但可能）
-            if "/user/index" in final_url or resp.history and any(
-                "/user/index" in str(h.url) for h in resp.history
-            ):
+            # 只检查最终的 final_url，不检查 history
+            # （history 中含有原始 URL /login?next=/user/index，不是成功标志）
+            if "/user/index" in final_url:
                 state.step = "done"
                 await self._extract_session_from_response(resp)
                 return state
@@ -220,13 +225,22 @@ class TronClassClient:
                 final_url = str(resp.url)
 
             # 判断登录结果
-            if "/user/index" in final_url or resp.history and any(
-                "/user/index" in str(h.url) for h in resp.history
-            ):
+            redirect_urls = [str(h.url) for h in resp.history]
+            logger.info(
+                f"登录 POST 完成：final_url={final_url}, "
+                f"history={redirect_urls}"
+            )
+
+            # 仅检查最终的 final_url，不检查 history
+            if "/user/index" in final_url:
                 # 登录成功
                 state.step = "done"
                 await self._extract_session_from_response(resp)
-                logger.info(f"登录成功：{state.username}")
+                logger.info(
+                    f"登录成功：{state.username}, "
+                    f"session_id={self._tron_session.session_id if self._tron_session else 'None'}, "
+                    f"cookies={list(self._tron_session.cookies.keys()) if self._tron_session else []}"
+                )
                 return state
 
             # 登录未成功，检查原因
@@ -237,7 +251,6 @@ class TronClassClient:
                     logger.info(f"需要短信验证码：{state.username}")
                 else:
                     state.captcha_type = "image"
-                    # 尝试提取图片验证码 URL
                     captcha_img = re.search(r'<img[^>]*src="([^"]*captcha[^"]*)"', html, re.IGNORECASE)
                     if captcha_img:
                         captcha_src = captcha_img.group(1)
@@ -249,18 +262,32 @@ class TronClassClient:
                         else:
                             state.captcha_url = captcha_src
                     logger.info(f"需要图片验证码：{state.username}")
-            elif "密码" in html or "password" in html.lower() or "错误" in html:
+            elif "密码" in html or "错误" in html:
                 state.step = "error"
                 logger.info(f"登录失败（凭据错误）：{state.username}")
             else:
-                # 可能有新的验证步骤（如短信验证码页面）
-                if "verify" in final_url.lower() or "sms" in final_url.lower() or "mobile" in final_url.lower():
+                # 检查是否需要短信/手机验证
+                sms_keywords = ["verify", "sms", "mobile", "phone", "验证", "短信", "手机"]
+                if any(kw in final_url.lower() for kw in sms_keywords) or \
+                   any(kw in html.lower() for kw in sms_keywords):
                     state.step = "wait_captcha"
                     state.captcha_type = "sms"
-                    logger.info(f"进入短信验证步骤：{state.username}")
+                    state.sms_action_url, state.sms_form_inputs, state.sms_captcha_field = \
+                        self._extract_form_info(html, resp.url)
+                    if not state.sms_action_url:
+                        state.sms_action_url = final_url
+                    state.sms_trigger_url = self._extract_sms_trigger(html, resp.url)
+                    logger.info(
+                        f"进入短信验证步骤：{state.username}, URL={final_url}, "
+                        f"captcha_field={state.sms_captcha_field}, "
+                        f"trigger_url={state.sms_trigger_url}"
+                    )
                 else:
                     state.step = "error"
-                    logger.warning(f"登录遇到未识别状态：URL={final_url}")
+                    logger.warning(
+                        f"登录遇到未识别状态：{state.username}, "
+                        f"URL={final_url}, html_len={len(html)}"
+                    )
 
         except asyncio.TimeoutError:
             state.step = "error"
@@ -268,6 +295,225 @@ class TronClassClient:
         except Exception as e:
             state.step = "error"
             logger.error(f"登录 POST 异常：{e}")
+
+        return state
+
+    def _extract_form_info(self, html: str, base_url) -> tuple:
+        """从 HTML 中提取 form 信息。
+
+        Returns:
+            (action_url, hidden_inputs, captcha_field_name)
+            - action_url: form 的 action URL
+            - hidden_inputs: {name: value} 所有隐藏/预填字段
+            - captcha_field_name: 验证码输入框的 name（推测），无则为 ""
+        """
+        action_url = ""
+        hidden_inputs = {}
+        captcha_field_name = ""
+
+        # 提取 form action
+        form_match = re.search(
+            r'<form[^>]*action="([^"]*)"[^>]*>', html, re.IGNORECASE
+        )
+        if form_match:
+            action = form_match.group(1)
+            if action.startswith("/"):
+                host = f"{base_url.scheme}://{base_url.host}"
+                if base_url.port:
+                    host += f":{base_url.port}"
+                action_url = host + action
+            else:
+                action_url = action
+
+        # 遍历所有 <input> 标签
+        for m in re.finditer(
+            r'<input\s+([^>]*)>', html, re.IGNORECASE
+        ):
+            attrs = m.group(1)
+            name_m = re.search(r'name="([^"]*)"', attrs)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+
+            type_m = re.search(r'type="([^"]*)"', attrs)
+            input_type = type_m.group(1).lower() if type_m else "text"
+
+            value_m = re.search(r'value="([^"]*)"', attrs)
+            value = value_m.group(1) if value_m else ""
+
+            # hidden 类型 → 预填值
+            if input_type == "hidden":
+                hidden_inputs[name] = value
+                continue
+
+            # 密码框跳过（不是验证码）
+            if input_type == "password":
+                continue
+
+            # 可见输入框（text/num/tel等），如果名含验证码关键词，则是 captcha
+            if any(kw in name.lower() for kw in (
+                "captcha", "smscode", "verifycode", "code", "验证码", "sms",
+            )):
+                captcha_field_name = name
+            # 如果没有 value 且还没有找到 captcha 字段，可能是验证码输入框
+            elif not value and not captcha_field_name:
+                captcha_field_name = name
+
+        logger.info(
+            f"提取表单：action={action_url}, "
+            f"hidden_fields={list(hidden_inputs.keys())}, "
+            f"captcha_field={captcha_field_name}"
+        )
+
+        return action_url, hidden_inputs, captcha_field_name
+
+    def _extract_sms_trigger(self, html: str, base_url) -> str:
+        """从 HTML 的 JS 中提取发送短信验证码的 API 端点。
+
+        匹配常见模式：
+        - sendDynamicCodeByPhone / getDynamicCode 等函数中的 URL
+        - /cas/sendSms, /authserver/sendDynamicCode 等路径
+        """
+        host = f"{base_url.scheme}://{base_url.host}"
+        if base_url.port:
+            host += f":{base_url.port}"
+
+        # 尝试从 <script> 中提取 URL
+        patterns = [
+            # jQuery: $.post("/path", ...) or $.get("/path", ...)
+            r'''['"]((?:https?:)?//[^'"]*send\w*(?:dynamic|sms|code|phone)[^'"]*|/(?:cas/|authserver/)?\w*send\w*(?:dynamic|sms|code|phone)[^'"]*)['"]''',
+            # 直接路径
+            r'''url:\s*['"]((?:/cas/|/authserver/)?\w*(?:send|sms|dynamic|code|phone)\w*[^'"]*)['"]''',
+            # fetch 调用
+            r'''fetch\(['"]((?:/cas/|/authserver/)?\w*(?:send|sms|dynamic|code|phone)\w*[^'"]*)['"]''',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                url = match.group(1)
+                if url.startswith("/"):
+                    return host + url
+                if url.startswith("//"):
+                    return f"{base_url.scheme}:{url}"
+                return url
+
+        # 通过 onclick 函数名反推 — CUC 的 sendDynamicCodeByPhone
+        # 常见 CAS 短信端点
+        guesses = [
+            "/authserver/sendDynamicCode",
+            "/cas/sendDynamicCode",
+            "/authserver/sendSms",
+            "/cas/sendSms",
+        ]
+        for guess in guesses:
+            # 在 JS 中检查是否有匹配的函数
+            if re.search(
+                r'(?:sendDynamicCode|sendSms|getDynamicCode)\s*\(',
+                html, re.IGNORECASE
+            ):
+                return host + guess
+
+        return ""
+
+    async def login_step_trigger_sms(self, state: LoginState) -> bool:
+        """触发发送短信验证码（模拟点击"获取验证码"按钮）。
+
+        Returns:
+            是否成功触发。
+        """
+        if not state.sms_trigger_url:
+            logger.warning("未找到短信触发 URL，跳过")
+            return False
+
+        await self._ensure_session()
+
+        try:
+            async with self._session.post(
+                state.sms_trigger_url,
+                data=state.sms_form_inputs,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                text = await resp.text()
+                logger.info(
+                    f"触发短信发送：url={state.sms_trigger_url}, "
+                    f"status={resp.status}, resp_len={len(text)}"
+                )
+                # 通常返回 JSON: {"success": true} 或类似
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"触发短信发送失败：{e}")
+            return False
+
+    async def login_step_submit_sms(
+        self, state: LoginState, sms_code: str
+    ) -> LoginState:
+        """提交短信验证码。
+
+        Args:
+            state: 当前登录状态（含 SMS 表单信息）。
+            sms_code: 用户输入的短信验证码。
+
+        Returns:
+            更新后的 LoginState。
+        """
+        await self._ensure_session()
+
+        form_data = dict(state.sms_form_inputs)
+        code_field = state.sms_captcha_field or "captcha"
+        form_data[code_field] = sms_code
+
+        post_url = state.sms_action_url or state.login_url
+
+        try:
+            async with self._session.post(
+                post_url,
+                data=form_data,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                html = await resp.text()
+                final_url = str(resp.url)
+
+            redirect_urls = [str(h.url) for h in resp.history]
+            logger.info(
+                f"SMS 提交完成：final_url={final_url}, history={redirect_urls}"
+            )
+
+            if "/user/index" in final_url:
+                state.step = "done"
+                await self._extract_session_from_response(resp)
+                logger.info(
+                    f"SMS 验证成功：{state.username}, "
+                    f"session_id={self._tron_session.session_id if self._tron_session else 'None'}"
+                )
+                return state
+
+            if "错误" in html or "error" in html.lower() or "无效" in html:
+                state.step = "wait_captcha"
+                logger.info(f"SMS 验证码错误：{state.username}")
+                return state
+
+            # 可能还需要更多验证
+            sms_keywords = ["verify", "sms", "mobile", "验证", "短信"]
+            if any(kw in final_url.lower() for kw in sms_keywords) or \
+               any(kw in html.lower() for kw in sms_keywords):
+                state.step = "wait_captcha"
+                state.sms_action_url, state.sms_form_inputs, state.sms_captcha_field = \
+                    self._extract_form_info(html, resp.url)
+                if not state.sms_action_url:
+                    state.sms_action_url = final_url
+                logger.info(f"仍需短信验证：{state.username}")
+                return state
+
+            state.step = "error"
+            logger.warning(f"SMS 提交后未识别状态：URL={final_url}")
+
+        except asyncio.TimeoutError:
+            state.step = "error"
+            logger.error(f"SMS 提交超时：{state.username}")
+        except Exception as e:
+            state.step = "error"
+            logger.error(f"SMS 提交异常：{e}")
 
         return state
 
@@ -296,19 +542,7 @@ class TronClassClient:
                         role_token = cookie.value
 
         # 估算过期时间（role_token 是 JWT，含 exp 字段）
-        expires_at = 0.0
-        if role_token:
-            try:
-                import base64
-                import json as json_mod
-                payload = role_token.split(".")[1]
-                # 补齐 padding
-                payload += "=" * (4 - len(payload) % 4)
-                decoded = json_mod.loads(base64.urlsafe_b64decode(payload))
-                if "exp" in decoded:
-                    expires_at = float(decoded["exp"])
-            except Exception:
-                expires_at = time.time() + 3600  # 默认 1 小时
+        expires_at = decode_jwt_expiry(role_token) if role_token else 0.0
 
         self._tron_session = TronClassSession(
             cookies=cookies,
@@ -326,15 +560,39 @@ class TronClassClient:
         path: str,
         **kwargs,
     ) -> aiohttp.ClientResponse:
-        """发送 API 请求，自动携带 session cookie。"""
+        """发送 API 请求，自动携带 session cookie 和 x-session-id 头。
+
+        自动检测 302 重定向到登录页 → 标记 session 过期。
+        """
         await self._ensure_session()
 
         url = f"{self.base_url}{path}"
         timeout = kwargs.pop("timeout", aiohttp.ClientTimeout(total=30))
 
-        return await self._session.request(
-            method, url, timeout=timeout, **kwargs
+        headers = kwargs.pop("headers", {})
+        if self._tron_session and self._tron_session.session_id:
+            headers["x-session-id"] = self._tron_session.session_id
+        headers.setdefault(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 12; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Version/4.0 Chrome/110.0.5481.154 Mobile Safari/537.36 "
+            "TronClass/common",
         )
+
+        resp = await self._session.request(
+            method, url, timeout=timeout, headers=headers, **kwargs
+        )
+
+        # 检测响应是否被重定向到了登录页（session 过期）
+        if resp.status in (301, 302, 303):
+            loc = resp.headers.get("Location", "")
+            if any(kw in loc for kw in ("/login", "/sso", "/auth", "identity")):
+                logger.warning(f"Session 已过期（API 重定向到登录页：{loc[:80]}）")
+                if self._tron_session:
+                    self._tron_session.expires_at = 0  # 强制标记过期
+
+        return resp
 
     async def get_json(self, path: str, **kwargs) -> dict:
         """发送 GET 请求并返回 JSON。"""
@@ -352,3 +610,36 @@ class TronClassClient:
         """获取当前点名列表。"""
         data = await self.get_json(f"{ENDPOINT_ROLLCALLS}?api_version=1.1.0")
         return data.get("rollcalls", data.get("results", []))
+
+    async def get_homework_activities(self, course_id: int) -> list[dict]:
+        """获取指定课程的作业活动列表（含截止时间）。"""
+        data = await self.get_json(
+            f"/api/courses/{course_id}/homework-activities"
+        )
+        return data.get("homework_activities", data.get("results", []))
+
+
+async def check_session_valid(client: TronClassClient) -> bool:
+    """检查 TronClassClient 的 session 是否仍然有效。
+
+    先检查 is_expired，再发一个轻量 API 请求验证。
+    返回 True 表示有效，False 表示应重新登录。
+
+    Args:
+        client: 已创建的 TronClassClient 实例。
+    """
+    if client.is_expired:
+        return False
+
+    try:
+        # 轻量验证：HEAD /user/index，只需检查是否被重定向
+        resp = await client._request("HEAD", "/user/index", allow_redirects=False)
+        async with resp:
+            if resp.status in (301, 302):
+                loc = resp.headers.get("Location", "")
+                if "login" in loc or "sso" in loc:
+                    return False
+        return True
+    except Exception:
+        # 网络异常时保守处理：不标记过期
+        return True

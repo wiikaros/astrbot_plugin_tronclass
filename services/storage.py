@@ -36,28 +36,9 @@ class StorageService:
         await self._plugin.delete_kv_data(f"session:{user_id}")
 
     async def get_all_session_user_ids(self) -> List[str]:
-        """获取所有已登录用户的 user_id 列表。
-
-        注意：这是一个简化实现，通过扫描已知 key 前缀来收集。
-        实际运行时，也可以通过维护一个额外的全局 key 来追踪。
-        """
-        # 通过 _all_logged_in_users 全局 key 获取
+        """获取所有已登录用户的 user_id 列表。"""
         users = await self._plugin.get_kv_data("_all_logged_in_users", default=[])
         return users if users else []
-
-    async def _mark_user_logged_in(self, user_id: str) -> None:
-        """标记用户为已登录状态。"""
-        users = await self.get_all_session_user_ids()
-        if user_id not in users:
-            users.append(user_id)
-            await self._plugin.put_kv_data("_all_logged_in_users", users)
-
-    async def _mark_user_logged_out(self, user_id: str) -> None:
-        """从已登录列表移除用户。"""
-        users = await self.get_all_session_user_ids()
-        if user_id in users:
-            users.remove(user_id)
-            await self._plugin.put_kv_data("_all_logged_in_users", users)
 
     # ========== 作业 ==========
 
@@ -116,3 +97,15 @@ class StorageService:
     async def delete_login_state(self, user_id: str) -> None:
         """清除登录状态机上下文。"""
         await self._plugin.delete_kv_data(f"login_state:{user_id}")
+
+    # ========== 点名时间追踪 ==========
+
+    async def get_last_rollcall_time(self, user_id: str) -> int:
+        """获取用户上次点名检测的时间戳。"""
+        return await self._plugin.get_kv_data(
+            f"_last_rollcall_check:{user_id}", default=0
+        )
+
+    async def set_last_rollcall_time(self, user_id: str, timestamp: int) -> None:
+        """记录用户上次点名检测的时间戳。"""
+        await self._plugin.put_kv_data(f"_last_rollcall_check:{user_id}", timestamp)
