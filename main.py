@@ -3,12 +3,14 @@
 import time
 import asyncio
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
 from astrbot.api import logger
-from astrbot.api.message_components import Plain
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.api.message_components import Image, Plain
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from astrbot.core.utils.io import download_file
+from astrbot.core.star import StarTools
 
 from .config import (
     LOGIN_STATE_TTL_SECONDS,
@@ -225,12 +227,12 @@ class TronClassPlugin(Star):
         qr_url = qr_info["qr_url"]
         wechat_state = qr_info["state"]
 
-        # Step 3: 发送二维码给用户
-        yield event.plain_result(
-            "📱 **微信扫码登录**\n\n"
-            f"请打开链接用微信扫描二维码：\n{qr_url}\n\n"
-            "扫码后请**点击确认登录**，等待自动完成..."
-        )
+        # Step 3: 发送二维码图片
+        yield event.chain_result([
+            Plain("📱 微信扫码登录\n请用微信扫描下方二维码，扫码后点击确认登录即可"),
+            Image.fromURL(qr_url),
+            Plain("等待自动完成..."),
+        ])
 
         # Step 4: 后台轮询 + 完成登录
         session_key = getattr(event, "unified_msg_origin", "") or getattr(event, "session", "")
@@ -650,81 +652,114 @@ class TronClassPlugin(Star):
 
     @filter.command("上传课表")
     async def cmd_upload_schedule(self, event: AstrMessageEvent):
-        """上传 .ics 课表文件。"""
+        """上传 .ics 课表文件。使用 session_waiter 等待用户发送文件。"""
         user_id = self._get_user_id(event)
 
-        # 尝试从消息中提取文件
-        ics_content = await self._extract_ics_from_event(event)
-
-        if ics_content is None:
-            yield event.plain_result(
-                "📅 请将 .ics 课表文件发送给我，同时附带命令 /上传课表。\n\n"
-                "获取方式：\n"
-                "1. 从学校教务系统导出课表（通常支持 .ics 格式）\n"
-                "2. 在手机/电脑日历 App 中导出课表为 .ics 文件\n"
-                "3. 将文件发送给我并附带此命令"
-            )
-            return
-
-        schedule = parse_ics(ics_content)
-        if schedule is None:
-            yield event.plain_result(
-                "❌ 课表文件解析失败。请确认：\n"
-                "1. 文件是标准的 .ics 格式\n"
-                "2. 文件内容完整无损坏\n"
-                "3. 文件包含课程事件（VEVENT）"
-            )
-            return
-
-        await self._storage.save_schedule(user_id, schedule)
-
-        # 统计信息
-        course_count = len(schedule.get("courses", []))
-        semester_start = schedule.get("semester_start", "未知")
-
         yield event.plain_result(
-            f"✅ 课表导入成功！\n"
-            f"📅 学期起始：{semester_start}\n"
-            f"📚 课程数量：{course_count} 门\n\n"
-            f"将在上课时间自动检测点名，无需手动操作。"
+            "📅 请在 120 秒内发送 .ics 课表文件，发送「退出」可取消。\n\n"
+            "获取方式：从学校教务系统导出课表为 .ics 文件，直接发送即可。"
         )
 
-    async def _extract_ics_from_event(self, event: AstrMessageEvent) -> str | None:
-        """从消息事件中提取 .ics 文件内容。"""
-        # 方式 1：消息附件
+        @session_waiter(timeout=120, record_history_chains=False)
+        async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            text = (evt.message_str or "").strip()
+            if text == "退出":
+                await evt.send(evt.plain_result("已取消上传。"))
+                controller.stop()
+                return
+
+            # 尝试从消息附件获取文件
+            file_url = await self._try_get_file_url(evt)
+            if not file_url:
+                await evt.send(evt.plain_result("未检测到文件，请直接发送 .ics 课表文件。发送「退出」可取消。"))
+                controller.keep(timeout=120, reset_timeout=True)
+                return
+
+            # 下载文件
+            await evt.send(evt.plain_result("正在下载课表文件..."))
+            ics_dir = StarTools.get_data_dir("astrbot_plugin_tronclass") / "ics"
+            ics_dir.mkdir(parents=True, exist_ok=True)
+            ics_path = ics_dir / f"{user_id}.ics"
+
+            try:
+                await download_file(file_url, str(ics_path))
+                content = ics_path.read_text(encoding="utf-8")
+            except Exception as e:
+                logger.error(f"下载 ICS 文件失败 [{user_id}]：{e}")
+                await evt.send(evt.plain_result("❌ 文件下载失败，请重试。"))
+                controller.stop()
+                return
+
+            # 解析
+            schedule = parse_ics(content)
+            if schedule is None:
+                await evt.send(evt.plain_result(
+                    "❌ 课表解析失败。请确认文件是标准的 .ics 格式，且包含课程事件。"
+                ))
+                controller.stop()
+                return
+
+            # 保存
+            await self._storage.save_schedule(user_id, schedule)
+            course_count = len(schedule.get("courses", []))
+            semester_start = schedule.get("semester_start", "未知")
+
+            await evt.send(evt.plain_result(
+                f"✅ 课表导入成功！\n"
+                f"📅 学期起始：{semester_start}\n"
+                f"📚 课程数量：{course_count} 门\n\n"
+                f"将在上课时间自动检测点名，无需手动操作。"
+            ))
+            controller.stop()
+
         try:
-            attachments = event.get_attachments()
-            if attachments:
-                for att in attachments:
-                    if isinstance(att, dict):
-                        name = att.get("name", att.get("filename", ""))
-                        url = att.get("url", "")
-                        content = att.get("content", "")
-                    else:
-                        name = getattr(att, "name", "") or getattr(att, "filename", "")
-                        url = getattr(att, "url", "")
-                        content = getattr(att, "content", "")
+            await waiter(event)
+        except TimeoutError:
+            yield event.plain_result("⏰ 上传超时，请重新发送 /上传课表。")
+        finally:
+            event.stop_event()
 
-                    if name.lower().endswith(".ics") or "ics" in name.lower():
-                        if content:
-                            return content
-                        if url:
-                            # 下载文件
-                            try:
-                                import aiohttp
-                                async with aiohttp.ClientSession() as session:
-                                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                                        resp.raise_for_status()
-                                        return await resp.text()
-                            except Exception as e:
-                                logger.error(f"下载 ICS 文件失败：{e}")
-                                return None
+    @staticmethod
+    async def _try_get_file_url(evt: AstrMessageEvent) -> str | None:
+        """从消息事件中提取 .ics 文件的下载 URL。"""
+        try:
+            # 尝试多种方式获取附件
+            attachments = None
+            for meth in ("get_attachments", "attachments", "get_uploaded_files"):
+                fn = getattr(evt, meth, None)
+                if callable(fn):
+                    attachments = fn()
+                elif fn is not None:
+                    attachments = fn
+                if attachments:
+                    break
+
+            if not attachments:
+                # 检查消息链中的 File 组件
+                try:
+                    messages = evt.get_messages()
+                    import astrbot.api.message_components as Comp
+                    for seg in (messages or []):
+                        if isinstance(seg, Comp.File):
+                            name = getattr(seg, "name", "") or getattr(seg, "file", "")
+                            url = getattr(seg, "url", "")
+                            if url and ("ics" in name.lower()):
+                                return url
+                except Exception:
+                    pass
+                return None
+
+            for att in (attachments or []):
+                if isinstance(att, dict):
+                    name = att.get("name", att.get("filename", ""))
+                    url = att.get("url", att.get("data", ""))
+                else:
+                    name = getattr(att, "name", "") or getattr(att, "filename", "")
+                    url = getattr(att, "url", "") or getattr(att, "data", "")
+                if name.lower().endswith(".ics") or "ics" in name.lower():
+                    if url:
+                        return url
         except Exception as e:
-            logger.debug(f"提取附件失败：{e}")
-
-        # 方式 2：消息本身就是 ICS 内容
-        text = event.message_str.strip()
-        if text.startswith("BEGIN:VCALENDAR"):
-            return text
+            logger.warning(f"[上传课表] 提取文件 URL 异常: {e}")
 
         return None
