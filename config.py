@@ -6,10 +6,12 @@ KV_HOMEWORKS_PREFIX = "homeworks"
 KV_SCHEDULE_PREFIX = "schedule"
 KV_ROLLCALL_STATES = "rollcall_states"
 KV_LOGIN_STATE_PREFIX = "login_state"
+KV_ALL_LOGGED_IN_USERS = "_all_logged_in_users"   # 已登录用户注册表（定时任务遍历用）
 
 # ========== 登录相关 ==========
 LOGIN_STATE_TTL_SECONDS = 300          # 登录状态超时（5 分钟）
 MAX_LOGIN_ATTEMPTS_PER_HOUR = 3        # 每小时最大登录尝试次数
+SSO_HOST = "https://sso.cuc.edu.cn"    # CAS 单点登录服务器（兜底默认，运行时从 cas_url 解析优先）
 
 # ========== 默认值 ==========
 DEFAULT_BASE_URL = "https://courses.cuc.edu.cn"

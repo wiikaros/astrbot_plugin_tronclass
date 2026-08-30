@@ -100,6 +100,7 @@ class SchedulerService:
         if not await check_session_valid(client):
             logger.info(f"Session 已过期 [{user_id}]，清理并通知用户")
             await self._storage.delete_session(user_id)
+            await self._storage.unregister_user(user_id)  # 保持注册表与真实 session 一致
             await client.close()
             # 通知用户重新登录
             try:

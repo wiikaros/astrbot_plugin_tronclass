@@ -38,7 +38,23 @@ class StorageService:
     async def get_all_session_user_ids(self) -> List[str]:
         """获取所有已登录用户的 user_id 列表。"""
         users = await self._plugin.get_kv_data("_all_logged_in_users", default=[])
-        return users if users else []
+        return users if isinstance(users, list) else []
+
+    async def register_user(self, user_id: str) -> None:
+        """登记已登录用户（幂等，重复调用不重复）。"""
+        users = await self._plugin.get_kv_data("_all_logged_in_users", default=[])
+        if not isinstance(users, list):
+            users = []
+        if user_id not in users:
+            users.append(user_id)
+            await self._plugin.put_kv_data("_all_logged_in_users", users)
+
+    async def unregister_user(self, user_id: str) -> None:
+        """从已登录列表移除用户（幂等）。"""
+        users = await self._plugin.get_kv_data("_all_logged_in_users", default=[])
+        if isinstance(users, list) and user_id in users:
+            users.remove(user_id)
+            await self._plugin.put_kv_data("_all_logged_in_users", users)
 
     # ========== 作业 ==========
 

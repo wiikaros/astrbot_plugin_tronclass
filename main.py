@@ -21,7 +21,7 @@ from .config import (
     DEFAULT_ROLLCALL_PRECHECK_MINUTES,
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
 )
-from .api.auth import TronClassClient
+from .api.auth import TronClassClient, SessionInvalidError
 from .api._utils import parse_datetime
 from .api.wechat_login import WeChatLoginFlow
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
@@ -41,6 +41,7 @@ class TronClassPlugin(Star):
         self._storage = StorageService(self)
         self._scheduler: SchedulerService | None = None
         self._wechat_tasks: dict[str, asyncio.Task] = {}  # user_id → polling task
+        self._login_clients: dict[str, TronClassClient] = {}  # 登录流程持有的 ClientSession
         logger.info("畅课助手插件已加载")
 
     async def terminate(self):
@@ -48,6 +49,12 @@ class TronClassPlugin(Star):
         for task in self._wechat_tasks.values():
             if not task.done():
                 task.cancel()
+        for client in self._login_clients.values():
+            try:
+                await client.close()
+            except Exception:
+                pass
+        self._login_clients.clear()
         logger.info("畅课助手插件已卸载")
 
     # ========== 辅助方法 ==========
@@ -156,7 +163,7 @@ class TronClassPlugin(Star):
         # 检查超时
         expires_at = login_state.get("expires_at", 0)
         if expires_at and time.time() > expires_at:
-            await self._storage.delete_login_state(user_id)
+            await self._finalize_login(user_id)
             yield event.plain_result(
                 "⏰ 登录流程已超时。请重新发送 /登录畅课"
             )
@@ -176,17 +183,31 @@ class TronClassPlugin(Star):
         elif step == "wait_password":
             async for result in self._handle_login_password(event, login_state, text):
                 yield result
-        elif step == "wait_captcha":
-            async for result in self._handle_login_captcha(event, login_state, text):
+        elif step == "wait_mfa_sms":
+            async for result in self._handle_login_mfa_sms(event, login_state, text):
                 yield result
+        else:
+            # 未知/异常步骤 → 清理状态，重新开始
+            await self._finalize_login(user_id)
+            yield event.plain_result(
+                "⚠️ 登录流程状态异常，请重新发送 /登录畅课"
+            )
 
     # ========== 命令：/重置登录限制 ==========
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置登录限制")
-    async def cmd_reset_login_limit(self, event: AstrMessageEvent):
-        """管理员命令：重置当前用户的登录频率限制。"""
-        user_id = self._get_user_id(event)
+    async def cmd_reset_login_limit(self, event: AstrMessageEvent, user_id: str = None):
+        """管理员命令：重置用户的登录频率限制。"""
+
+        # 如果未指定 user_id，则默认重置当前用户的限制
+        if user_id is None:
+            user_id = self._get_user_id(event)
+
+        # 如果指定的 user_id 不存在
+        if not await self.get_kv_data(f"_login_attempts:{user_id}"):
+            yield event.plain_result(f"⚠️ 用户 {user_id} 没有登录尝试记录，无需重置。")
+            return
         await self.delete_kv_data(f"_login_attempts:{user_id}")
         yield event.plain_result("✅ 登录限制已重置，可以重新登录了。")
 
@@ -252,6 +273,31 @@ class TronClassPlugin(Star):
                     return
 
                 await self._storage.save_session(user_id, session_data)
+                await self._storage.register_user(user_id)
+
+                # 校验 session 有效性 + 顺手拉取一次作业（失败不影响登录）
+                try:
+                    client = TronClassClient.from_session_data(session_data)
+                    valid = await client.verify_session()
+                    if valid:
+                        try:
+                            fresh = await fetch_homeworks(client)
+                            await self._storage.save_homeworks(user_id, fresh)
+                        except Exception as e:
+                            logger.warning(
+                                f"微信登录后拉取作业失败（不影响登录）[{user_id}]：{e}"
+                            )
+                    await client.close()
+                    if not valid:
+                        await self._storage.delete_session(user_id)
+                        await self._storage.unregister_user(user_id)
+                        await _send_notice(
+                            "❌ 微信登录未完成（会话校验未通过），请重试 /微信登录"
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"微信登录会话校验异常 [{user_id}]：{e}")
+
                 await _send_notice("✅ 微信登录成功！你可以使用 /作业列表 查看作业了。")
             except asyncio.CancelledError:
                 pass
@@ -294,17 +340,12 @@ class TronClassPlugin(Star):
             return
 
         # 清除旧状态
-        await self._storage.delete_login_state(user_id)
+        await self._finalize_login(user_id)
 
         login_state = {
             "step": "wait_username",
             "username": "",
             "password": "",
-            "captcha_type": "",
-            "execution": "",
-            "lt_token": "",
-            "login_url": "",
-            "captcha_url": "",
             "expires_at": time.time() + LOGIN_STATE_TTL_SECONDS,
             "retries": 0,
         }
@@ -326,197 +367,175 @@ class TronClassPlugin(Star):
     async def _handle_login_password(
         self, event: AstrMessageEvent, login_state: dict, text: str
     ):
-        """处理用户输入密码，尝试第一步登录。"""
+        """处理用户输入密码，执行 CAS 登录主流程（含 MFA 触发）。"""
         user_id = self._get_user_id(event)
-        login_state["password"] = text.strip()
-        login_state["step"] = "logging_in"
-        await self._storage.save_login_state(user_id, login_state)
+        username = login_state.get("username", "")
+        password = text.strip()
+        if not username or not password:
+            yield event.plain_result("⚠️ 用户名或密码不能为空，请重新发送 /登录畅课")
+            return
 
-        base_url = self._get_base_url()
-        client = TronClassClient(base_url)
+        client = self._login_clients.get(user_id)
+        if client is None:
+            client = TronClassClient(self._get_base_url())
+            self._login_clients[user_id] = client
 
         try:
-            # 第一步：获取登录页面，提取 token
-            state = await client.login_step_get_login_page(
-                login_state["username"], login_state["password"]
-            )
-
-            if state.step == "done":
-                # 直接登录成功（无额外验证）
-                session_data = client.get_session_data()
-                if session_data:
-                    await self._storage.save_session(user_id, session_data)
-                await self._storage.delete_login_state(user_id)
-                await client.close()
-                yield event.plain_result("✅ 登录成功！你可以使用 /作业列表 查看作业了。")
-                return
-
-            elif state.step == "wait_password":
-                # 需要提交密码（正常流程）
-                result_state = await client.login_step_submit(state)
-
-                if result_state.step == "done":
-                    session_data = client.get_session_data()
-                    if session_data:
-                        await self._storage.save_session(user_id, session_data)
-                    await self._storage.delete_login_state(user_id)
-                    await client.close()
-                    yield event.plain_result(
-                        "✅ 登录成功！你可以使用 /作业列表 查看作业了。"
-                    )
-                    return
-
-                elif result_state.step == "wait_captcha":
-                    # 需要验证码
-                    captcha_type = result_state.captcha_type
-                    self._save_login_state_with_auth(
-                        login_state, result_state, captcha_type
-                    )
-                    await self._storage.save_login_state(user_id, login_state)
-
-                    if captcha_type == "image":
-                        msg = "📷 需要输入图片验证码\n请输入图片中的验证码："
-                        if result_state.captcha_url:
-                            msg = (
-                                f"📷 需要输入图片验证码\n"
-                                f"验证码图片：{result_state.captcha_url}\n"
-                                f"请打开链接查看并输入验证码："
-                            )
-                        yield event.plain_result(msg)
-                    else:
-                        triggered = await client.login_step_trigger_sms(result_state)
-                        if triggered:
-                            yield event.plain_result(
-                                "📱 需要手机短信验证码\n"
-                                "已触发短信发送，请输入收到的验证码："
-                            )
-                        else:
-                            yield event.plain_result(
-                                "📱 需要手机短信验证码\n请输入收到的验证码："
-                            )
-                    return
-
-                else:
-                    await self._storage.delete_login_state(user_id)
-                    await client.close()
-                    yield event.plain_result(
-                        "❌ 登录失败：用户名或密码错误，请重新发送 /登录畅课"
-                    )
-                    return
-
-            elif state.step == "error":
-                await self._storage.delete_login_state(user_id)
-                await client.close()
-                yield event.plain_result(
-                    "❌ 登录失败：无法连接到畅课服务器，请稍后重试。\n"
-                    "请检查网络或服务器地址配置。"
-                )
-                return
-
+            state = await client.login_with_password(username, password)
+        except RuntimeError as e:
+            # pycryptodome 缺失等
+            await self._finalize_login(user_id)
+            yield event.plain_result(f"❌ {e}")
+            return
         except Exception as e:
             logger.error(f"登录异常 [{user_id}]：{e}")
-            await self._storage.delete_login_state(user_id)
-            await client.close()
-            yield event.plain_result(
-                f"❌ 登录过程出现异常：{e}\n请稍后重试或联系管理员。"
-            )
+            await self._finalize_login(user_id)
+            yield event.plain_result("❌ 登录过程出现异常，请稍后重试。")
+            return
 
-    async def _handle_login_captcha(
+        if state.step == "done":
+            async for result in self._login_success_finalize(event, user_id, client):
+                yield result
+            return
+
+        if state.step == "wait_mfa_sms":
+            # 进入短信二次认证：清除密码，只存轻量状态
+            login_state.pop("password", None)
+            login_state["step"] = "wait_mfa_sms"
+            login_state["mfa_url"] = state.mfa_url
+            login_state["mfa_service"] = state.mfa_service
+            login_state["sso_host"] = state.sso_host
+            login_state["retries"] = 0
+            login_state["expires_at"] = time.time() + LOGIN_STATE_TTL_SECONDS
+            await self._storage.save_login_state(user_id, login_state)
+            if state.sms_sent:
+                yield event.plain_result(
+                    "📱 需要短信二次认证，验证码已发送，请输入收到的验证码："
+                )
+            else:
+                yield event.plain_result(
+                    "📱 需要短信二次认证，但短信发送可能失败，"
+                    "请稍后重试或重新发送 /登录畅课"
+                )
+            return
+
+        if state.step == "need_slider_captcha":
+            await self._finalize_login(user_id)
+            yield event.plain_result(
+                f"⚠️ {state.error_msg}\n建议改用 /微信登录"
+            )
+            return
+
+        # error
+        await self._finalize_login(user_id)
+        yield event.plain_result(
+            f"❌ {state.error_msg}\n请重新发送 /登录畅课"
+        )
+
+    async def _handle_login_mfa_sms(
         self, event: AstrMessageEvent, login_state: dict, text: str
     ):
-        """处理用户输入验证码。"""
+        """处理用户输入短信验证码，提交 MFA 并完成登录。"""
         user_id = self._get_user_id(event)
-        captcha = text.strip()
+        client = self._login_clients.get(user_id)
+        if client is None:
+            await self._finalize_login(user_id)
+            yield event.plain_result(
+                "⚠️ 登录状态已失效（进程可能已重启），请重新发送 /登录畅课"
+            )
+            return
 
-        base_url = self._get_base_url()
-        client = TronClassClient(base_url)
+        from .api.auth import LoginState
+        state = LoginState(
+            username=login_state.get("username", ""),
+            mfa_service=login_state.get("mfa_service", ""),
+            sso_host=login_state.get("sso_host", ""),
+            mfa_url=login_state.get("mfa_url", ""),
+        )
 
         try:
-            # 重建 LoginState
-            from .api.auth import LoginState
-            state = LoginState(
-                username=login_state["username"],
-                password=login_state["password"],
-                captcha_type=login_state["captcha_type"],
-                lt_token=login_state["lt_token"],
-                execution=login_state["execution"],
-                login_url=login_state["login_url"],
-                captcha_url=login_state.get("captcha_url", ""),
-                sms_action_url=login_state.get("sms_action_url", ""),
-                sms_form_inputs=login_state.get("sms_form_inputs", {}),
-                sms_captcha_field=login_state.get("sms_captcha_field", ""),
-            )
-
-            if login_state["captcha_type"] == "sms":
-                result_state = await client.login_step_submit_sms(state, captcha)
-            else:
-                result_state = await client.login_step_submit(state, captcha=captcha)
-
-            if result_state.step == "done":
-                session_data = client.get_session_data()
-                if session_data:
-                    await self._storage.save_session(user_id, session_data)
-                await self._storage.delete_login_state(user_id)
-                await client.close()
-                yield event.plain_result(
-                    "✅ 登录成功！你可以使用 /作业列表 查看作业了。"
-                )
-                return
-
-            elif result_state.step == "wait_captcha":
-                # 验证码错误，重试
-                login_state["retries"] = login_state.get("retries", 0) + 1
-                if login_state["retries"] >= 3:
-                    await self._storage.delete_login_state(user_id)
-                    await client.close()
-                    yield event.plain_result(
-                        "❌ 验证码错误次数过多，登录已取消。\n"
-                        "请重新发送 /登录畅课"
-                    )
-                    return
-
-                self._save_login_state_with_auth(
-                    login_state, result_state,
-                    result_state.captcha_type or login_state["captcha_type"],
-                )
-                await self._storage.save_login_state(user_id, login_state)
-
-                yield event.plain_result(
-                    f"❌ 验证码错误，请重新输入（剩余 {3 - login_state['retries']} 次尝试）："
-                )
-                return
-
-            else:
-                await self._storage.delete_login_state(user_id)
-                await client.close()
-                yield event.plain_result(
-                    "❌ 登录失败，请重新发送 /登录畅课"
-                )
-                return
-
+            result = await client.login_submit_mfa_sms(state, text.strip())
         except Exception as e:
-            logger.error(f"验证码登录异常 [{user_id}]：{e}")
-            await self._storage.delete_login_state(user_id)
-            await client.close()
-            yield event.plain_result(
-                f"❌ 登录异常：{e}\n请稍后重试。"
-            )
+            logger.error(f"MFA 短信提交异常 [{user_id}]：{e}")
+            await self._finalize_login(user_id)
+            yield event.plain_result("❌ 短信验证提交异常，请重新发送 /登录畅课")
+            return
 
-    def _save_login_state_with_auth(
-        self, login_state: dict, auth_state, captcha_type: str
+        if result.step == "done":
+            async for r in self._login_success_finalize(event, user_id, client):
+                yield r
+            return
+
+        if result.step == "wait_mfa_sms":
+            # 验证码错误，重试
+            login_state["retries"] = login_state.get("retries", 0) + 1
+            if login_state["retries"] >= 3:
+                await self._finalize_login(user_id)
+                yield event.plain_result(
+                    "❌ 验证码错误次数过多，登录已取消。\n请重新发送 /登录畅课"
+                )
+                return
+            login_state["expires_at"] = time.time() + LOGIN_STATE_TTL_SECONDS
+            await self._storage.save_login_state(user_id, login_state)
+            yield event.plain_result(
+                f"❌ 验证码错误，请重新输入（剩余 {3 - login_state['retries']} 次尝试）："
+            )
+            return
+
+        # error
+        await self._finalize_login(user_id)
+        yield event.plain_result(
+            f"❌ {result.error_msg or '短信验证失败'}\n请重新发送 /登录畅课"
+        )
+
+    async def _login_success_finalize(
+        self, event: AstrMessageEvent, user_id: str, client: TronClassClient
     ):
-        """将 auth 层的 LoginState 数据同步到 KV 中的 login_state。"""
-        login_state["step"] = "wait_captcha"
-        login_state["captcha_type"] = captcha_type
-        login_state["lt_token"] = auth_state.lt_token
-        login_state["execution"] = auth_state.execution
-        login_state["login_url"] = auth_state.login_url
-        login_state["captcha_url"] = auth_state.captcha_url
-        login_state["sms_action_url"] = getattr(auth_state, "sms_action_url", "")
-        login_state["sms_form_inputs"] = getattr(auth_state, "sms_form_inputs", {})
-        login_state["sms_captcha_field"] = getattr(auth_state, "sms_captcha_field", "")
-        login_state["sms_trigger_url"] = getattr(auth_state, "sms_trigger_url", "")
-        login_state["expires_at"] = time.time() + LOGIN_STATE_TTL_SECONDS
+        """登录成功统一收尾：自检 → 保存 session → 登记 → 拉取作业填充缓存。"""
+        session_data = client.get_session_data()
+        if not session_data:
+            await self._finalize_login(user_id)
+            yield event.plain_result(
+                "❌ 登录未完成（未获取到 session），请重新发送 /登录畅课"
+            )
+            return
+
+        try:
+            valid = await client.verify_session()
+        except Exception:
+            valid = False
+        if not valid:
+            logger.error(f"登录后 session 自检失败 [{user_id}]，不保存")
+            await self._finalize_login(user_id)
+            yield event.plain_result(
+                "❌ 登录未完成（会话校验未通过），请重新发送 /登录畅课"
+            )
+            return
+
+        await self._storage.save_session(user_id, session_data)
+        await self._storage.register_user(user_id)
+
+        # 登录成功即拉取一次作业，保证 /作业列表 立即可查
+        try:
+            fresh = await fetch_homeworks(client)
+            await self._storage.save_homeworks(user_id, fresh)
+        except Exception as e:
+            logger.warning(f"登录后拉取作业失败（不影响登录）[{user_id}]：{e}")
+
+        await self._finalize_login(user_id)
+        yield event.plain_result(
+            "✅ 登录成功！你可以使用 /作业列表 查看作业了。"
+        )
+
+    async def _finalize_login(self, user_id: str):
+        """清 KV login_state + close 并删除内存中的登录 client。"""
+        await self._storage.delete_login_state(user_id)
+        client = self._login_clients.pop(user_id, None)
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
 
     async def _check_login_rate_limit(self, user_id: str) -> bool:
         """检查登录频率限制。"""
@@ -610,6 +629,16 @@ class TronClassPlugin(Star):
 
         try:
             fresh = await fetch_homeworks(client)
+        except SessionInvalidError as e:
+            # session 已失效：清理本地状态并引导重新登录
+            await client.close()
+            await self._storage.delete_session(user_id)
+            await self._storage.unregister_user(user_id)
+            logger.warning(f"更新作业时 session 失效 [{user_id}]")
+            yield event.plain_result(
+                f"⚠️ {e}\n请在私聊中重新发送 /登录畅课 或 /微信登录"
+            )
+            return
         except Exception as e:
             await client.close()
             logger.error(f"获取作业列表失败 [{user_id}]：{e}")
