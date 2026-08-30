@@ -28,4 +28,10 @@ data/
 # Project-specific
 示例数据包/
 CLAUDE.md
-tests/
+
+# Sensitive debug artifacts (never commit real credentials)
+debug/session.json
+debug/*.html
+
+# Build artifacts
+main.zip
