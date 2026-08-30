@@ -77,3 +77,47 @@ def parse_datetime(s: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+async def download_file_http(
+    url: str,
+    dest,
+    timeout: float = 30.0,
+) -> str:
+    """用 aiohttp 下载文件到本地（替代 astrbot.core.utils.io.download_file 内部 API）。
+
+    Args:
+        url: 下载地址。
+        dest: 目标路径（str 或 pathlib.Path）。
+        timeout: 整体超时（秒）。
+
+    Returns:
+        下载完成后的目标路径字符串。
+
+    Raises:
+        ValueError: scheme 非 http/https（防 SSRF 低风险面）。
+        aiohttp.ClientError / OSError: 下载失败；半成品文件会被清理。
+    """
+    import aiohttp
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"不支持的下载协议: {parsed.scheme!r}")
+
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+    tmp_path.replace(dest_path)
+    return str(dest_path)

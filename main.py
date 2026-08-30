@@ -4,13 +4,10 @@ import time
 import asyncio
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, register
-from astrbot.core import AstrBotConfig
-from astrbot.api import logger
+from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api import logger, AstrBotConfig
 from astrbot.api.message_components import Image, Plain
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
-from astrbot.core.utils.io import download_file
-from astrbot.core.star import StarTools
 
 from .config import (
     LOGIN_STATE_TTL_SECONDS,
@@ -22,7 +19,7 @@ from .config import (
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
 )
 from .api.auth import TronClassClient, SessionInvalidError
-from .api._utils import parse_datetime
+from .api._utils import parse_datetime, download_file_http
 from .api.wechat_login import WeChatLoginFlow
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from .api.rollcall import fetch_rollcalls, detect_new_rollcalls
@@ -124,32 +121,37 @@ class TronClassPlugin(Star):
         """插件加载完成后初始化定时任务。"""
         logger.info("畅课助手：初始化定时任务...")
 
-        self._scheduler = SchedulerService(
-            context=self.context,
-            storage=self._storage,
-            base_url=self._get_base_url(),
-            homework_interval=self._get_config(
-                "homework_check_interval", DEFAULT_HOMEWORK_CHECK_INTERVAL
-            ),
-            rollcall_default_interval=self._get_config(
-                "rollcall_default_interval", DEFAULT_ROLLCALL_DEFAULT_INTERVAL
-            ),
-            precheck_minutes=self._get_config(
-                "rollcall_class_precheck_minutes", DEFAULT_ROLLCALL_PRECHECK_MINUTES
-            ),
-            due_warn_hours=self._get_config(
-                "homework_due_warn_hours", DEFAULT_HOMEWORK_DUE_WARN_HOURS
-            ),
-            enable_homework_notify=self._get_config(
-                "enable_new_homework_notify", True
-            ),
-            enable_due_warning=self._get_config("enable_due_warning", True),
-            enable_rollcall_notify=self._get_config(
-                "enable_rollcall_notify", True
-            ),
-        )
-        await self._scheduler.setup()
-        logger.info("畅课助手：定时任务初始化完成")
+        try:
+            self._scheduler = SchedulerService(
+                context=self.context,
+                storage=self._storage,
+                base_url=self._get_base_url(),
+                homework_interval=self._get_config(
+                    "homework_check_interval", DEFAULT_HOMEWORK_CHECK_INTERVAL
+                ),
+                rollcall_default_interval=self._get_config(
+                    "rollcall_default_interval", DEFAULT_ROLLCALL_DEFAULT_INTERVAL
+                ),
+                precheck_minutes=self._get_config(
+                    "rollcall_class_precheck_minutes", DEFAULT_ROLLCALL_PRECHECK_MINUTES
+                ),
+                due_warn_hours=self._get_config(
+                    "homework_due_warn_hours", DEFAULT_HOMEWORK_DUE_WARN_HOURS
+                ),
+                enable_homework_notify=self._get_config(
+                    "enable_new_homework_notify", True
+                ),
+                enable_due_warning=self._get_config("enable_due_warning", True),
+                enable_rollcall_notify=self._get_config(
+                    "enable_rollcall_notify", True
+                ),
+            )
+            await self._scheduler.setup()
+            logger.info("畅课助手：定时任务初始化完成")
+        except Exception as e:
+            # 定时任务注册失败不阻塞插件加载，仅降级（无自动通知）
+            logger.error(f"定时任务初始化失败，自动通知功能将不可用：{e}")
+            self._scheduler = None
 
     # ========== 事件：任意消息 — 登录状态机驱动器 ==========
 
@@ -280,6 +282,10 @@ class TronClassPlugin(Star):
 
                 await self._storage.save_session(user_id, session_data)
                 await self._storage.register_user(user_id)
+                # 记录会话源，供定时任务主动推送私聊通知使用
+                await self._storage.save_session_origin(
+                    user_id, session_key
+                )
 
                 # 校验 session 有效性 + 顺手拉取一次作业（失败不影响登录）
                 try:
@@ -520,6 +526,10 @@ class TronClassPlugin(Star):
 
         await self._storage.save_session(user_id, session_data)
         await self._storage.register_user(user_id)
+        # 记录会话源，供定时任务主动推送私聊通知使用
+        await self._storage.save_session_origin(
+            user_id, getattr(event, "unified_msg_origin", "") or ""
+        )
 
         # 登录成功即拉取一次作业，保证 /作业列表 立即可查
         try:
@@ -718,7 +728,7 @@ class TronClassPlugin(Star):
             ics_path = ics_dir / f"{user_id}.ics"
 
             try:
-                await download_file(file_url, str(ics_path))
+                await download_file_http(file_url, ics_path)
                 content = ics_path.read_text(encoding="utf-8")
             except Exception as e:
                 logger.error(f"下载 ICS 文件失败 [{user_id}]：{e}")
