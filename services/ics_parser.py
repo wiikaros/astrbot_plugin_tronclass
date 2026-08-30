@@ -1,12 +1,10 @@
 """.ics 课表文件解析与上课时间判断。"""
 
-from datetime import datetime, date, time, timedelta
-from typing import Optional, Dict, List, Tuple
+from datetime import datetime, date, timedelta
+from typing import Optional, List
 
 import icalendar
 from astrbot.api import logger
-
-from ..config import ICS_DAYS_MAP
 
 
 def parse_ics(content: str) -> Optional[dict]:
@@ -31,6 +29,10 @@ def parse_ics(content: str) -> Optional[dict]:
             ]
         }
         解析失败返回 None。
+
+    H1 修复说明：周次计算必须使用**全局**学期起点（最早上课事件所在周的周一），
+    分两阶段处理——先收集全部事件日期，再统一计算周次，
+    避免"结果依赖 VEVENT 在文件中的出现顺序"的缺陷。
     """
     try:
         cal = icalendar.Calendar.from_ical(content)
@@ -38,26 +40,47 @@ def parse_ics(content: str) -> Optional[dict]:
         logger.error(f"ICS 解析失败：{e}")
         return None
 
-    courses = []
+    # ---- 第一遍：收集有效事件，计算全局学期起点 ----
+    raw_events = []
     earliest_start = None
-
     for component in cal.walk():
         if component.name != "VEVENT":
             continue
-
         summary = str(component.get("summary", ""))
         if not summary:
             continue
-
-        # 提取起止时间
         dtstart = component.get("dtstart")
-        dtend = component.get("dtend")
-        location = str(component.get("location", ""))
-
         if dtstart is None:
             continue
-
         dtstart = dtstart.dt
+        if isinstance(dtstart, datetime):
+            start_date = dtstart.date()
+        elif isinstance(dtstart, date):
+            start_date = dtstart
+        else:
+            continue
+        if earliest_start is None or start_date < earliest_start:
+            earliest_start = start_date
+        raw_events.append((component, summary, dtstart))
+
+    if not raw_events:
+        logger.warning("ICS 文件中未找到课程事件")
+        return None
+
+    # 全局学期起点 = 最早上课事件所在周的周一
+    if earliest_start:
+        weekday = earliest_start.isoweekday()
+        global_semester_start = earliest_start - timedelta(days=weekday - 1)
+        semester_start_str = global_semester_start.strftime("%Y-%m-%d")
+    else:
+        global_semester_start = datetime.now().date()
+        semester_start_str = global_semester_start.strftime("%Y-%m-%d")
+
+    # ---- 第二遍：逐事件解析（统一使用全局学期起点计算周次）----
+    courses = []
+    for component, summary, dtstart in raw_events:
+        dtend = component.get("dtend")
+        location = str(component.get("location", ""))
         dtend = dtend.dt if dtend else None
 
         # 如果是 datetime，提取日期和时间
@@ -74,21 +97,7 @@ def parse_ics(content: str) -> Optional[dict]:
         else:
             continue
 
-        # 记录最早日期作为学期起始
-        if earliest_start is None or start_date < earliest_start:
-            earliest_start = start_date
-
-        # 提取周次
-        weeks = _extract_weeks(component, start_date, earliest_start or start_date)
-
-        # 提取重复规则中的终止日期
-        rrule = component.get("rrule")
-        if rrule:
-            until = rrule.get("UNTIL")
-            if until:
-                until_date = until[0] if isinstance(until, list) else until
-                if hasattr(until_date, "date"):
-                    until_date = until_date.date() if isinstance(until_date, datetime) else until_date
+        weeks = _extract_weeks(component, start_date, global_semester_start)
 
         course = {
             "name": summary.strip(),
@@ -99,19 +108,6 @@ def parse_ics(content: str) -> Optional[dict]:
             "location": location.strip() if location else "",
         }
         courses.append(course)
-
-    if not courses:
-        logger.warning("ICS 文件中未找到课程事件")
-        return None
-
-    # 计算学期开始日期（第一周周一）
-    if earliest_start:
-        # 找到该周的周一
-        weekday = earliest_start.isoweekday()
-        semester_start = earliest_start - timedelta(days=weekday - 1)
-        semester_start_str = semester_start.strftime("%Y-%m-%d")
-    else:
-        semester_start_str = datetime.now().strftime("%Y-%m-%d")
 
     # 去重（同一课程可能有多个 VEVENT）
     seen = set()
@@ -144,7 +140,6 @@ def _extract_weeks(component, start_date: date, semester_start: date) -> List[in
             return [week_num]
         return [1]
 
-    freq = str(rrule.get("FREQ", ["WEEKLY"])[0])
     interval = int(rrule.get("INTERVAL", [1])[0]) if rrule.get("INTERVAL") else 1
     count = int(rrule.get("COUNT", [0])[0]) if rrule.get("COUNT") else 0
 
@@ -208,15 +203,11 @@ def is_in_class_now(
     if current_week < 1 or current_week > 52:
         return False
 
-    today_weekday = now.isoweekday()
-    current_time = now.time()
     precheck_delta = timedelta(minutes=precheck_minutes)
+    # 本教学周的周一（用于把"周几"映射到绝对日期，支撑跨天课程判定）
+    monday = now.date() - timedelta(days=now.isoweekday() - 1)
 
     for course in schedule["courses"]:
-        # 检查星期几
-        if course.get("day") != today_weekday:
-            continue
-
         # 检查周次
         weeks = course.get("weeks", [])
         if weeks and current_week not in weeks:
@@ -229,19 +220,25 @@ def is_in_class_now(
         except (ValueError, KeyError):
             continue
 
-        # 构造 datetime 用于计算
-        start_dt = datetime.combine(now.date(), start_t)
-        end_dt = datetime.combine(now.date(), end_t)
-        check_start = start_dt - precheck_delta
+        day = course.get("day")
+        if not isinstance(day, int) or not (1 <= day <= 7):
+            continue
 
-        # 处理跨天课程（罕见但可能）
+        # M5 修复：先锚定"本教学周内课程开始日"的绝对时间点，
+        # 再做跨天调整与检测窗口计算——否则跨天课程（如 23:30-00:30）
+        # 次日凌晨时段会因 day 不匹配或 check_start 锚定错误而漏判。
+        class_date = monday + timedelta(days=day - 1)
+        start_dt = datetime.combine(class_date, start_t)
+        end_dt = datetime.combine(class_date, end_t)
         if end_dt < start_dt:
-            end_dt += timedelta(days=1)
+            end_dt += timedelta(days=1)  # 跨天课程：结束时间顺延至次日
+
+        check_start = start_dt - precheck_delta
 
         if check_start <= now <= end_dt:
             logger.debug(
                 f"上课中：{course['name']} "
-                f"(周{current_week} 周{today_weekday} "
+                f"(周{current_week} 周{day} "
                 f"{course['start']}-{course['end']})"
             )
             return True
