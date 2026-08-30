@@ -49,6 +49,12 @@ class TronClassPlugin(Star):
         for task in self._wechat_tasks.values():
             if not task.done():
                 task.cancel()
+        # 注销定时任务，防止热重载后旧实例任务残留重复执行（框架合规 L1）
+        if self._scheduler is not None:
+            try:
+                await self._scheduler.shutdown()
+            except Exception as e:
+                logger.warning(f"注销定时任务异常: {e}")
         for client in self._login_clients.values():
             try:
                 await client.close()
@@ -554,9 +560,10 @@ class TronClassPlugin(Star):
 
     # ========== 命令：/调试作业 ==========
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("调试作业")
     async def cmd_debug_homework(self, event: AstrMessageEvent):
-        """调试用：打印缓存的原始作业数据。"""
+        """调试用（仅管理员）：打印缓存的原始作业数据。"""
         user_id = self._get_user_id(event)
         homeworks = await self._storage.get_homeworks(user_id)
         if not homeworks:

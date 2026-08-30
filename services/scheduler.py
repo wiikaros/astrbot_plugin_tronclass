@@ -65,6 +65,24 @@ class SchedulerService:
             f"点名检测每 {self._rollcall_default_interval} 分钟"
         )
 
+    async def shutdown(self):
+        """插件卸载/重载时注销全部定时任务。
+
+        修复框架合规 L1：cron_manager 是全局注册表，若不注销，
+        插件热重载后旧实例的 persistent=False 任务会残留并重复执行
+        （handler 仍引用旧实例）。本方法幂等，重复调用安全。
+        """
+        cron = getattr(self._context, "cron_manager", None)
+        if cron is None:
+            return
+        for job_id in list(self._homework_job_ids) + list(self._rollcall_job_ids):
+            try:
+                await cron.delete_job(job_id)
+            except Exception as e:
+                logger.warning(f"注销定时任务失败 job_id={job_id}: {e}")
+        self._homework_job_ids.clear()
+        self._rollcall_job_ids.clear()
+
     async def _schedule_homework_check(self):
         """注册作业定时检测任务。"""
         job = await self._context.cron_manager.add_basic_job(
