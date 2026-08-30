@@ -1,3 +1,4 @@
 aiohttp>=3.9
 icalendar>=5.0
 pycryptodome>=3.19,<4
+cryptography>=42

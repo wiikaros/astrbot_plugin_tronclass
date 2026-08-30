@@ -4,9 +4,16 @@
 隔离不同用户的数据，隐藏原始 KV key 拼接细节。
 """
 
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Optional, List
 
+from astrbot.api import logger
 from astrbot.api.star import Star
+
+from .session_cipher import SessionCipher
+
+# Session 存储格式版本（v2 = Fernet 密文）
+SESSION_ENC_VERSION = 2
 
 
 class StorageService:
@@ -16,24 +23,78 @@ class StorageService:
         storage = StorageService(plugin_instance)
         await storage.save_homeworks(user_id, data)
         homeworks = await storage.get_homeworks(user_id)
+
+    Session 凭据（H4 修复）：save_session 自动加密，get_session 自动解密，
+    并对旧版明文数据做一次性迁移（读明文 → 重写为密文）。
     """
 
-    def __init__(self, plugin: Star):
+    def __init__(self, plugin: Star, key_path: Path | None = None):
         self._plugin = plugin
+        self._key_path = key_path
+        self._cipher: SessionCipher | None = None
+
+    def _get_cipher(self) -> SessionCipher:
+        """懒加载 SessionCipher（默认密钥文件位于插件数据目录）。"""
+        if self._cipher is None:
+            if self._key_path is None:
+                from astrbot.api.star import StarTools
+
+                self._key_path = StarTools.get_data_dir() / ".session_key"
+            self._cipher = SessionCipher(self._key_path)
+        return self._cipher
 
     # ========== Session ==========
 
     async def save_session(self, user_id: str, data: dict) -> None:
-        """保存用户 session。"""
-        await self._plugin.put_kv_data(f"session:{user_id}", data)
+        """保存用户 session（自动 Fernet 加密后落 KV）。"""
+        encrypted = self._get_cipher().encrypt_dict(data)
+        await self._plugin.put_kv_data(
+            f"session:{user_id}",
+            {"v": SESSION_ENC_VERSION, "data": encrypted},
+        )
 
     async def get_session(self, user_id: str) -> Optional[dict]:
-        """获取用户 session。"""
-        return await self._plugin.get_kv_data(f"session:{user_id}", default=None)
+        """获取用户 session（自动解密；旧明文自动迁移为密文）。"""
+        raw = await self._plugin.get_kv_data(f"session:{user_id}", default=None)
+        if raw is None:
+            return None
+
+        # 新版密文格式
+        if (
+            isinstance(raw, dict)
+            and raw.get("v") == SESSION_ENC_VERSION
+            and isinstance(raw.get("data"), str)
+        ):
+            return self._get_cipher().decrypt_dict_or_none(raw["data"])
+
+        # 旧版明文（dict 无 v 标记）→ 迁移为密文后返回明文给调用方
+        if isinstance(raw, dict) and "data" not in raw:
+            try:
+                await self.save_session(user_id, raw)
+            except Exception as e:
+                logger.warning(f"旧明文 session 迁移加密失败 [{user_id}]：{e}")
+            return raw
+
+        # 无法识别的数据形态
+        logger.warning(f"session 数据形态异常，已忽略 [{user_id}]")
+        return None
 
     async def delete_session(self, user_id: str) -> None:
         """删除用户 session。"""
         await self._plugin.delete_kv_data(f"session:{user_id}")
+
+    async def save_session_origin(self, user_id: str, origin: str) -> None:
+        """记录用户的会话源（unified_msg_origin），供定时任务主动推送使用。"""
+        if not origin:
+            return
+        await self._plugin.put_kv_data(f"session_origin:{user_id}", origin)
+
+    async def get_session_origin(self, user_id: str) -> Optional[str]:
+        """获取用户的会话源（unified_msg_origin）。"""
+        origin = await self._plugin.get_kv_data(
+            f"session_origin:{user_id}", default=None
+        )
+        return origin if isinstance(origin, str) else None
 
     async def get_all_session_user_ids(self) -> List[str]:
         """获取所有已登录用户的 user_id 列表。"""
