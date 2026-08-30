@@ -4,6 +4,7 @@
 支持 ICS 课表驱动的智能点名检测。
 """
 
+import asyncio
 import time
 from typing import Optional
 
@@ -55,6 +56,11 @@ class SchedulerService:
         self._homework_job_ids: list[str] = []
         # 点名检测 job ID
         self._rollcall_job_ids: list[str] = []
+        # verify_session 结果缓存（M3）：{user_id: (ok, checked_at)}，避免每次 cron 触发都真实请求
+        self._session_check_cache: dict[str, tuple[bool, float]] = {}
+
+    # verify_session 结果缓存 TTL（秒）
+    SESSION_CHECK_TTL = 600
 
     async def setup(self):
         """首次启动时注册所有定时任务。"""
@@ -110,12 +116,12 @@ class SchedulerService:
     # ========== 帮助方法 ==========
 
     async def _get_client_for_user(self, user_id: str) -> Optional[TronClassClient]:
-        """为用户创建已认证的 API 客户端，自动检查过期。"""
+        """为用户创建已认证的 API 客户端，自动检查过期（带 TTL 缓存）。"""
         session_data = await self._storage.get_session(user_id)
         if session_data is None:
             return None
         client = TronClassClient.from_session_data(session_data)
-        if not await check_session_valid(client):
+        if not await self._check_session_valid_cached(user_id, client):
             logger.info(f"Session 已过期 [{user_id}]，清理并通知用户")
             await self._storage.delete_session(user_id)
             await self._storage.unregister_user(user_id)  # 保持注册表与真实 session 一致
@@ -130,6 +136,21 @@ class SchedulerService:
                 pass
             return None
         return client
+
+    async def _check_session_valid_cached(self, user_id: str, client: TronClassClient) -> bool:
+        """verify_session 结果 TTL 缓存（M3）。
+
+        - 命中缓存（10 分钟内）直接返回，避免重复真实 API 自检；
+        - `is_expired`（JWT exp）由 check_session_valid 内部短路，仍优先；
+        - 缓存失败结果同样 10 分钟，但失败路径会清理 session/注册表，后续不再触发。
+        """
+        cached = self._session_check_cache.get(user_id)
+        now = time.time()
+        if cached and now - cached[1] < self.SESSION_CHECK_TTL:
+            return cached[0]
+        ok = await check_session_valid(client)
+        self._session_check_cache[user_id] = (ok, now)
+        return ok
 
     # ========== 作业检测 ==========
 
@@ -149,54 +170,52 @@ class SchedulerService:
 
         logger.debug(f"作业定时检测：{len(user_ids)} 个用户")
 
-        for user_id in user_ids:
-            try:
-                await self._check_homeworks_for_user(user_id)
-            except Exception as e:
-                logger.error(f"作业检测失败 [{user_id}]：{e}")
+        # M2 优化：用户间并发处理（Semaphore 限流），单用户异常不中断整轮
+        sem = asyncio.Semaphore(5)
+
+        async def _run(uid: str):
+            async with sem:
+                try:
+                    await self._check_homeworks_for_user(uid)
+                except Exception as e:
+                    logger.error(f"作业检测失败 [{uid}]：{e}")
+
+        await asyncio.gather(*(_run(uid) for uid in user_ids), return_exceptions=True)
 
     async def _check_homeworks_for_user(self, user_id: str):
-        """为单个用户检测作业更新。"""
+        """为单个用户检测作业更新（client 生命周期由 finally 统一收口）。"""
         client = await self._get_client_for_user(user_id)
         if client is None:
             return
-
         try:
             fresh = await fetch_homeworks(client)
+
+            cached = await self._storage.get_homeworks(user_id)
+            diff = diff_homeworks(cached, fresh)
+            await self._storage.save_homeworks(user_id, fresh)
+
+            # 检查快到期
+            imminent = []
+            if self._enable_due_warning:
+                imminent = get_imminent_due(fresh, self._due_warn_hours)
+
+            added = diff["added"] if self._enable_homework_notify else []
+
+            # 没有变化则静默
+            if not added and not imminent:
+                return
+
+            # 生成通知
+            messages = format_multiple_homework_notifications(added, imminent)
+            for msg in messages:
+                try:
+                    await self._send_private_notification(user_id, msg)
+                except Exception as e:
+                    logger.error(f"推送作业通知失败 [{user_id}]：{e}")
         except Exception as e:
-            await client.close()
             logger.warning(f"获取作业列表失败 [{user_id}]：{e}")
-            return
-
-        cached = await self._storage.get_homeworks(user_id)
-
-        diff = diff_homeworks(cached, fresh)
-
-        # 保存最新数据
-        await self._storage.save_homeworks(user_id, fresh)
-
-        # 检查快到期
-        imminent = []
-        if self._enable_due_warning:
-            imminent = get_imminent_due(fresh, self._due_warn_hours)
-
-        added = diff["added"] if self._enable_homework_notify else []
-
-        # 没有变化则静默
-        if not added and not imminent:
+        finally:
             await client.close()
-            return
-
-        # 生成通知
-        messages = format_multiple_homework_notifications(added, imminent)
-
-        for msg in messages:
-            try:
-                await self._send_private_notification(user_id, msg)
-            except Exception as e:
-                logger.error(f"推送作业通知失败 [{user_id}]：{e}")
-
-        await client.close()
 
     # ========== 点名检测 ==========
 
@@ -218,14 +237,20 @@ class SchedulerService:
         if not user_ids:
             return
 
-        for user_id in user_ids:
-            try:
-                await self._check_rollcalls_for_user(user_id)
-            except Exception as e:
-                logger.error(f"点名检测失败 [{user_id}]：{e}")
+        # M2 优化：用户间并发处理（Semaphore 限流），单用户异常不中断整轮
+        sem = asyncio.Semaphore(5)
+
+        async def _run(uid: str):
+            async with sem:
+                try:
+                    await self._check_rollcalls_for_user(uid)
+                except Exception as e:
+                    logger.error(f"点名检测失败 [{uid}]：{e}")
+
+        await asyncio.gather(*(_run(uid) for uid in user_ids), return_exceptions=True)
 
     async def _check_rollcalls_for_user(self, user_id: str):
-        """为单个用户检测点名更新。"""
+        """为单个用户检测点名更新（client 生命周期由 finally 统一收口）。"""
         schedule = await self._storage.get_schedule(user_id)
 
         if schedule:
@@ -240,35 +265,30 @@ class SchedulerService:
         client = await self._get_client_for_user(user_id)
         if client is None:
             return
-
         try:
             current = await fetch_rollcalls(client)
+            if not current:
+                return
+
+            # 检测新点名
+            last_seen = await self._storage.get_rollcall_seen_ids(user_id)
+            new_rollcalls = detect_new_rollcalls(current, last_seen)
+
+            # 更新已见 ID
+            current_ids = {rc.get("id") for rc in current if rc.get("id") is not None}
+            await self._storage.update_rollcall_seen_ids(user_id, current_ids)
+
+            # 推送通知
+            for rc in new_rollcalls:
+                msg = format_new_rollcall(rc)
+                try:
+                    await self._send_private_notification(user_id, msg)
+                except Exception as e:
+                    logger.error(f"推送点名通知失败 [{user_id}]：{e}")
         except Exception as e:
-            await client.close()
             logger.warning(f"获取点名列表失败 [{user_id}]：{e}")
-            return
-
-        if not current:
+        finally:
             await client.close()
-            return
-
-        # 检测新点名
-        last_seen = await self._storage.get_rollcall_seen_ids(user_id)
-        new_rollcalls = detect_new_rollcalls(current, last_seen)
-
-        # 更新已见 ID
-        current_ids = {rc.get("id") for rc in current if rc.get("id") is not None}
-        await self._storage.update_rollcall_seen_ids(user_id, current_ids)
-
-        # 推送通知
-        for rc in new_rollcalls:
-            msg = format_new_rollcall(rc)
-            try:
-                await self._send_private_notification(user_id, msg)
-            except Exception as e:
-                logger.error(f"推送点名通知失败 [{user_id}]：{e}")
-
-        await client.close()
 
     async def _should_check_rollcall_by_default(self, user_id: str) -> bool:
         """检查是否到达无课表时的默认点名检测间隔。"""
