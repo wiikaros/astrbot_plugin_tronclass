@@ -20,16 +20,14 @@ import secrets
 import asyncio
 from typing import Optional, Dict
 from dataclasses import dataclass, field
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import aiohttp
 from yarl import URL
-from urllib.parse import quote, urljoin
 from astrbot.api import logger
 
 from ._utils import decode_jwt_expiry
 from ..config import (
-    LOGIN_STATE_TTL_SECONDS,
     ENDPOINT_TODOS,
     ENDPOINT_ROLLCALLS,
     SSO_HOST,
@@ -509,11 +507,9 @@ class TronClassClient:
             js_m = re.search(r'"service"\s*:\s*"([^"]*)"', html_text)
             if js_m:
                 # JSON 转义还原：\/ → /，再处理 HTML 实体（&amp; 等）
-                cfg["mfa_service"] = (
+                cfg["mfa_service"] = html.unescape(
                     js_m.group(1).replace("\\/", "/")
-                    if js_m else ""
                 )
-                cfg["mfa_service"] = html.unescape(cfg["mfa_service"])
             else:
                 cfg["mfa_service"] = ""
         rt_m = re.search(r'"reAuthType"\s*:\s*"?(\d+)"?', html_text)

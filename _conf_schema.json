@@ -5,6 +5,7 @@
         "items": {
             "base_url": {
                 "description": "畅课服务器地址",
+                "hint": "支持自定义域名，默认使用中国传媒大学畅课",
                 "type": "string",
                 "default": "https://courses.cuc.edu.cn"
             },
@@ -17,36 +18,25 @@
     },
     "homework_check_interval": {
         "description": "作业定时检测间隔（分钟）",
+        "hint": "范围建议 10-120 分钟",
         "type": "int",
-        "default": 30,
-        "slider": {
-            "min": 10,
-            "max": 120,
-            "step": 5
-        }
+        "default": 30
     },
     "rollcall_default_interval": {
         "description": "无课表时的点名检测间隔（分钟）",
+        "hint": "范围建议 1-60 分钟",
         "type": "int",
-        "default": 5,
-        "slider": {
-            "min": 1,
-            "max": 60,
-            "step": 1
-        }
+        "default": 5
     },
     "rollcall_class_precheck_minutes": {
         "description": "上课前提前开始检测的分钟数",
+        "hint": "范围建议 0-15 分钟",
         "type": "int",
-        "default": 5,
-        "slider": {
-            "min": 0,
-            "max": 15,
-            "step": 1
-        }
+        "default": 5
     },
     "homework_due_warn_hours": {
         "description": "作业快到期提醒阈值（小时）",
+        "hint": "距截止时间小于该值（小时）时推送提醒",
         "type": "int",
         "default": 24
     },
