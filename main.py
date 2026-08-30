@@ -1,16 +1,18 @@
 """AstrBot 畅课（TronClass）插件 — 入口模块。"""
 
+import re
 import time
 import asyncio
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.message_components import Image, Plain
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 
 from .config import (
     LOGIN_STATE_TTL_SECONDS,
+    KV_LOGIN_ATTEMPTS_PREFIX,
     MAX_LOGIN_ATTEMPTS_PER_HOUR,
     DEFAULT_BASE_URL,
     DEFAULT_HOMEWORK_CHECK_INTERVAL,
@@ -19,13 +21,12 @@ from .config import (
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
 )
 from .api.auth import TronClassClient, SessionInvalidError
-from .api._utils import parse_datetime, download_file_http
+from .api._utils import download_file_http
 from .api.wechat_login import WeChatLoginFlow
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
-from .api.rollcall import fetch_rollcalls, detect_new_rollcalls
 from .services.storage import StorageService
 from .services.ics_parser import parse_ics
-from .services.notifier import format_homework_summary
+from .services.notifier import format_homework_summary, _fmt_due
 from .services.scheduler import SchedulerService
 
 
@@ -92,16 +93,6 @@ class TronClassPlugin(Star):
     def _get_base_url(self) -> str:
         """获取配置的畅课服务器地址。"""
         return self._get_config("school.base_url", DEFAULT_BASE_URL)
-
-    @staticmethod
-    def _fmt_due(iso_str: str) -> str:
-        """将 ISO 格式时间转为可读形式，如 '6月30日 15:59'。"""
-        if not iso_str:
-            return "未知截止时间"
-        dt = parse_datetime(iso_str)
-        if dt:
-            return dt.strftime("%m月%d日 %H:%M")
-        return iso_str
 
     async def _create_client(self, user_id: str) -> TronClassClient | None:
         """为用户创建已认证的 API 客户端。"""
@@ -213,10 +204,10 @@ class TronClassPlugin(Star):
             user_id = self._get_user_id(event)
 
         # 如果指定的 user_id 不存在
-        if not await self.get_kv_data(f"_login_attempts:{user_id}"):
+        if not await self.get_kv_data(f"{KV_LOGIN_ATTEMPTS_PREFIX}:{user_id}"):
             yield event.plain_result(f"⚠️ 用户 {user_id} 没有登录尝试记录，无需重置。")
             return
-        await self.delete_kv_data(f"_login_attempts:{user_id}")
+        await self.delete_kv_data(f"{KV_LOGIN_ATTEMPTS_PREFIX}:{user_id}")
         yield event.plain_result("✅ 登录限制已重置，可以重新登录了。")
 
     # ========== 命令：/微信登录 ==========
@@ -338,16 +329,16 @@ class TronClassPlugin(Star):
         """交互式登录畅课账号。"""
         user_id = self._get_user_id(event)
 
-        # 频率限制检查
-        if not await self._check_login_rate_limit(user_id):
-            yield event.plain_result(
-                "⚠️ 登录尝试过于频繁，请 1 小时后再试。"
-            )
-            return
-
+        # L6：先校验私聊（群聊触发不消耗频率配额），再检查频率限制
         if not self._is_private_chat(event):
             yield event.plain_result(
                 "🔐 登录涉及账号密码，请在**私聊**中发送 /登录畅课"
+            )
+            return
+
+        if not await self._check_login_rate_limit(user_id):
+            yield event.plain_result(
+                "⚠️ 登录尝试过于频繁，请 1 小时后再试。"
             )
             return
 
@@ -555,8 +546,11 @@ class TronClassPlugin(Star):
 
     async def _check_login_rate_limit(self, user_id: str) -> bool:
         """检查登录频率限制。"""
-        key = f"_login_attempts:{user_id}"
+        key = f"{KV_LOGIN_ATTEMPTS_PREFIX}:{user_id}"
         attempts = await self.get_kv_data(key, default=[])
+        # M9：KV 脏数据（非列表）防御
+        if not isinstance(attempts, list):
+            attempts = []
         now = time.time()
 
         # 清理 1 小时前的记录
@@ -618,7 +612,7 @@ class TronClassPlugin(Star):
         for i, hw in enumerate(active, 1):
             course = hw.get("course_name", "未知课程")
             title = hw.get("title", "未命名作业")
-            due = self._fmt_due(hw.get("due_at", ""))
+            due = _fmt_due(hw.get("due_at", ""))
             status = hw.get("status", "未知")
             lines.append(f"{i}.《{course}》{title}")
             lines.append(f"   ⏰ 截止: {due}")
@@ -689,7 +683,7 @@ class TronClassPlugin(Star):
             for hw in imminent:
                 course = hw.get("course_name", "?")
                 title = hw.get("title", "?")
-                due = self._fmt_due(hw.get("due_at", ""))
+                due = _fmt_due(hw.get("due_at", ""))
                 summary += f"  - 《{course}》{title}（截止：{due}）\n"
 
         yield event.plain_result(summary)
@@ -725,7 +719,9 @@ class TronClassPlugin(Star):
             await evt.send(evt.plain_result("正在下载课表文件..."))
             ics_dir = StarTools.get_data_dir("astrbot_plugin_tronclass") / "ics"
             ics_dir.mkdir(parents=True, exist_ok=True)
-            ics_path = ics_dir / f"{user_id}.ics"
+            # L3：user_id 来自平台 sender_id，先 sanitize 再拼文件名，防路径穿越
+            safe_id = re.sub(r"[^\w.-]", "_", user_id or "")
+            ics_path = ics_dir / f"{safe_id}.ics"
 
             try:
                 await download_file_http(file_url, ics_path)
