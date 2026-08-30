@@ -7,6 +7,7 @@ KV_HOMEWORKS_PREFIX = "homeworks"
 KV_SCHEDULE_PREFIX = "schedule"
 KV_ROLLCALL_SEEN_PREFIX = "rollcall_seen"
 KV_LOGIN_STATE_PREFIX = "login_state"
+KV_LOGIN_STATE_INDEX = "_login_state_index"      # 进行中登录索引（启动清扫用）
 KV_LAST_ROLLCALL_CHECK_PREFIX = "_last_rollcall_check"
 KV_ALL_LOGGED_IN_USERS = "_all_logged_in_users"   # 已登录用户注册表（定时任务遍历用）
 KV_LOGIN_ATTEMPTS_PREFIX = "_login_attempts"      # 登录频率限制

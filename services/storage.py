@@ -18,6 +18,7 @@ from ..config import (
     KV_SCHEDULE_PREFIX,
     KV_ROLLCALL_SEEN_PREFIX,
     KV_LOGIN_STATE_PREFIX,
+    KV_LOGIN_STATE_INDEX,
     KV_LAST_ROLLCALL_CHECK_PREFIX,
     KV_ALL_LOGGED_IN_USERS,
 )
@@ -185,6 +186,33 @@ class StorageService:
     async def delete_login_state(self, user_id: str) -> None:
         """清除登录状态机上下文。"""
         await self._plugin.delete_kv_data(f"{KV_LOGIN_STATE_PREFIX}:{user_id}")
+
+    # ========== 登录状态索引（启动清扫用） ==========
+
+    async def mark_login_started(self, user_id: str) -> None:
+        """登记进行中的登录（幂等），供进程重启后清扫残留 KV。"""
+        users = await self._plugin.get_kv_data(KV_LOGIN_STATE_INDEX, default=[])
+        if not isinstance(users, list):
+            users = []
+        if user_id not in users:
+            users.append(user_id)
+            await self._plugin.put_kv_data(KV_LOGIN_STATE_INDEX, users)
+
+    async def mark_login_finished(self, user_id: str) -> None:
+        """从索引移除登录记录（幂等）。"""
+        users = await self._plugin.get_kv_data(KV_LOGIN_STATE_INDEX, default=[])
+        if isinstance(users, list) and user_id in users:
+            users.remove(user_id)
+            await self._plugin.put_kv_data(KV_LOGIN_STATE_INDEX, users)
+
+    async def get_login_state_user_ids(self) -> List[str]:
+        """获取所有残留登录状态对应的 user_id（启动清扫用）。"""
+        users = await self._plugin.get_kv_data(KV_LOGIN_STATE_INDEX, default=[])
+        return users if isinstance(users, list) else []
+
+    async def clear_login_state_index(self) -> None:
+        """清空登录状态索引（启动清扫后调用）。"""
+        await self._plugin.put_kv_data(KV_LOGIN_STATE_INDEX, [])
 
     # ========== 点名时间追踪 ==========
 
