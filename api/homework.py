@@ -1,7 +1,10 @@
 """畅课作业 API 封装。"""
 
+import asyncio
 from typing import List
 from datetime import datetime, timedelta
+
+from astrbot.api import logger
 
 from .auth import TronClassClient
 
@@ -11,27 +14,31 @@ async def fetch_homeworks(client: TronClassClient) -> List[dict]:
 
     /api/todos 只返回 id/title/course，不含 due_at 和 status。
     需要调 /api/courses/{course_id}/homework-activities 获取详情。
+
+    M1 优化：各课程的详情请求并行发出（asyncio.gather），
+    单课程失败不影响整体结果（跳过该课程，沿用 todos 的缺省字段）。
     """
     todos = await client.get_todos()
 
-    # 收集所有涉及的 course_id，批量获取作业详情
-    course_ids = set()
-    for item in todos:
-        cid = item.get("course_id")
-        if cid:
-            course_ids.add(cid)
+    # 收集所有涉及的 course_id，并行获取作业详情
+    course_ids = list({
+        item.get("course_id")
+        for item in todos
+        if item.get("course_id")
+    })
 
-    # 并行获取各课程的作业活动
-    from astrbot.api import logger as _logger
+    results = await asyncio.gather(
+        *(client.get_homework_activities(cid) for cid in course_ids),
+        return_exceptions=True,
+    )
+
     activities = {}
-    for cid in course_ids:
-        try:
-            acts = await client.get_homework_activities(cid)
-            _logger.info(f"course {cid}: {len(acts)} activities, keys={list(acts[0].keys()) if acts else 'EMPTY'}")
-            for act in acts:
-                activities[act.get("id")] = act
-        except Exception as e:
-            _logger.warning(f"course {cid} homework-activities 获取失败: {e}")
+    for cid, result in zip(course_ids, results):
+        if isinstance(result, BaseException):
+            logger.warning(f"course {cid} homework-activities 获取失败: {result}")
+            continue
+        for act in result:
+            activities[act.get("id")] = act
 
     homeworks = []
     for item in todos:
@@ -76,8 +83,10 @@ def diff_homeworks(
             "unchanged": [...], # 无变化的作业
         }
     """
-    cached_map = {h["id"]: h for h in cached if h.get("id") is not None}
-    fresh_map = {h["id"]: h for h in fresh if h.get("id") is not None}
+    # L7 修复：id 统一按字符串规范化匹配，
+    # 避免缓存与 API 返回的 id 类型不一致（int vs str）导致全部误判新增/移除
+    cached_map = {str(h.get("id")): h for h in cached if h.get("id") is not None}
+    fresh_map = {str(h.get("id")): h for h in fresh if h.get("id") is not None}
 
     added = []
     updated = []
