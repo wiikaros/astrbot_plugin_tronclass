@@ -285,24 +285,25 @@ class SchedulerService:
     # ========== 通知发送 ==========
 
     async def _send_private_notification(self, user_id: str, message: str):
-        """给指定用户发送私聊通知。"""
+        """给指定用户发送私聊通知（官方 context.send_message API，框架合规 C5）。
+
+        依赖登录成功时保存的 unified_msg_origin（session_origin）。
+        老用户无该记录时无法主动推送，记录 warning 引导重新登录。
+        """
         try:
-            pm = self._context.platform_manager
-            adapters = None
-            for attr in ("adapters", "get_adapters", "get_all_adapters", "_adapters"):
-                val = getattr(pm, attr, None)
-                if val is not None:
-                    adapters = val() if callable(val) else val
-                    break
+            origin = await self._storage.get_session_origin(user_id)
+            if not origin:
+                logger.warning(
+                    f"用户 {user_id} 无会话源记录（unified_msg_origin），"
+                    f"无法推送定时通知，请重新登录"
+                )
+                return
 
-            if adapters:
-                for adapter in adapters:
-                    try:
-                        await adapter.send_private_message(user_id, message)
-                        return
-                    except Exception:
-                        continue
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Plain
 
-            logger.warning(f"无法发送私聊消息 [{user_id}]")
+            await self._context.send_message(
+                origin, MessageChain([Plain(message)])
+            )
         except Exception as e:
             logger.error(f"发送私聊消息失败 [{user_id}]：{e}")

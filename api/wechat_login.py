@@ -228,7 +228,7 @@ class WeChatLoginFlow:
                 "base_url": self.base_url,
                 "expires_at": expires_at,
             }
-            logger.info(f"[微信登录] ✅ 成功，session_id={session_id[:30]}...")
+            logger.info(f"[微信登录] ✅ 成功，session_id_len={len(session_id)}")
             return session_data
 
         except Exception as e:
