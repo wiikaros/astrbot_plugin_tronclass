@@ -29,7 +29,7 @@ git clone https://github.com/wiikaros/astrbot_plugin_tronclass.git
 
 2. 重启 AstrBot 或在 WebUI 中加载插件。
 
-3. 插件依赖会在加载时自动安装（`aiohttp`, `icalendar`）。
+3. 插件依赖会在加载时自动安装（`aiohttp`, `icalendar`, `pycryptodome`, `cryptography`）。
 
 ## 使用
 
@@ -70,16 +70,24 @@ git clone https://github.com/wiikaros/astrbot_plugin_tronclass.git
 - **点名检测**：有课表时仅在上课时间检测；无课表时每 5 分钟检测一次
 - **Session 过期**：主动检测登录过期，私聊提醒用户重新登录
 
+> ⚠️ **平台兼容性**：定时主动推送依赖 IM 平台的主动消息 API，仅以下平台支持：
+> Telegram、OneBot v11（NapCat/Lagrange 等）、Slack、飞书、Discord、Misskey、Satori。
+> 其他平台（如 QQ 官方 API、微信）无法主动推送通知，请以 `/更新作业` 手动查询。
+
 ## 命令一览
 
 | 命令 | 功能 | 适用场景 |
 |------|------|---------|
 | `/微信登录` | 微信扫码登录 | 私聊 |
-| `/登录畅课` | 账号密码登录 | 私聊 |
+| `/登录畅课` | 账号密码登录（多轮交互） | 私聊 |
 | `/作业列表` | 查询未完成作业 | 群聊/私聊 |
 | `/更新作业` | 手动刷新作业列表 | 群聊/私聊 |
 | `/上传课表` | 上传 .ics 课表文件 | 私聊/群聊（带文件） |
 | `/重置登录限制` | 清除登录频率限制 | 管理员 |
+| `/调试作业` | 打印缓存原始作业数据 | 管理员 |
+
+> 💡 **登录期间的会话行为**：密码登录进行中，该用户的其他命令会被暂时拦截
+> （提示"登录流程进行中"），发送「退出」可取消登录流程。
 
 ## 配置
 
@@ -100,35 +108,42 @@ git clone https://github.com/wiikaros/astrbot_plugin_tronclass.git
 
 ```bash
 pip install pytest
-python -m pytest tests/ -v  # 29 个用例
+python -m pytest tests/ -v  # 87 个用例
 ```
 
 ## 项目结构
 
 ```
 astrbot_plugin_tronclass/
-├── main.py                # 插件入口，命令注册，登录状态机
+├── main.py                # 插件入口：命令注册、加载/卸载生命周期
 ├── metadata.yaml           # 插件元数据
 ├── _conf_schema.json       # WebUI 可视化配置面板
-├── requirements.txt        # aiohttp, icalendar
+├── requirements.txt        # aiohttp, icalendar, pycryptodome, cryptography
 ├── config.py               # 常量与默认值
 ├── api/
 │   ├── __init__.py
-│   ├── _utils.py           # 内部工具函数（JWT 解码、日期解析）
+│   ├── _utils.py           # 内部工具函数（JWT 解码、日期解析、文件下载）
 │   ├── auth.py             # CAS SSO 登录、Session 管理、密码登录
 │   ├── wechat_login.py     # 微信扫码登录（combinedLogin 流程）
 │   ├── homework.py         # 作业 API + 比对 + 快到期检测
 │   └── rollcall.py         # 点名 API + 新点名检测
 ├── services/
 │   ├── __init__.py
-│   ├── storage.py          # KV 存储统一封装
+│   ├── login_flow.py       # 登录流程（session_waiter 密码交互 + 微信后台轮询）
+│   ├── session_cipher.py   # Session 凭据 Fernet 加密
+│   ├── storage.py          # KV 存储统一封装（含加密、会话源、登录索引）
 │   ├── ics_parser.py       # .ics 课表解析 + is_in_class_now()
-│   ├── scheduler.py        # Cron 定时任务管理
+│   ├── scheduler.py        # Cron 定时任务管理（含卸载注销）
 │   └── notifier.py         # 通知消息生成器
-├── tests/                  # 单元测试（29 用例）
+├── tests/                  # 单元测试（87 用例）
 │   ├── test_homework.py
 │   ├── test_ics_parser.py
-│   └── test_rollcall.py
+│   ├── test_utils.py
+│   ├── test_session_cipher.py
+│   ├── test_login_flow.py
+│   ├── test_encrypt.py
+│   ├── test_rollcall.py
+│   └── test_storage.py
 ├── debug/                  # 独立调试工具（不随插件加载）
 │   └── login_debug.py
 └── 示例数据包/              # API 请求/响应样例
