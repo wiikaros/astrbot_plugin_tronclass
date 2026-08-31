@@ -17,6 +17,7 @@ venv/
 .pytest_cache/
 htmlcov/
 .coverage
+tests/
 
 # OS
 .DS_Store
@@ -28,6 +29,7 @@ data/
 # Project-specific
 示例数据包/
 CLAUDE.md
+.workbuddy/
 
 # Sensitive debug artifacts (never commit real credentials)
 debug/session.json
