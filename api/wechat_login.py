@@ -135,6 +135,55 @@ class WeChatLoginFlow:
             logger.error(f"[微信登录] 获取 QR 失败: {e}")
             return None
 
+    async def download_qr_image(self, qr_url: str, dest) -> bool:
+        """下载微信二维码为本地图片（供 `Image.fromFileSystem` 直接发送）。
+
+        部分平台适配器（如 QQ 官方 API）无法/拒绝拉取微信外链图片，
+        由插件侧主动下载可保证二维码以图片形式送达。微信对二维码端点
+        有 UA / Referer 校验，必须携带移动端 UA 与 Referer 头。
+
+        Args:
+            qr_url: 二维码图片 URL（open.weixin.qq.com/connect/qrcode/{uuid}）。
+            dest: 本地保存路径（str 或 pathlib.Path）。
+
+        Returns:
+            True 下载成功（文件已写入）；False 失败（调用方降级处理）。
+        """
+        await self._ensure_session()
+        try:
+            from pathlib import Path
+
+            dest_path = Path(dest)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 12; wv) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Version/4.0 Chrome/110.0.5481.154 Mobile Safari/537.36"
+                ),
+                "Referer": "https://open.weixin.qq.com/",
+            }
+            async with self._session.get(
+                qr_url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[微信登录] 二维码下载失败 status={resp.status}")
+                    return False
+                if "image" not in (resp.content_type or ""):
+                    logger.warning(
+                        f"[微信登录] 二维码响应非图片类型: {resp.content_type}"
+                    )
+                    return False
+                content = await resp.read()
+            dest_path.write_bytes(content)
+            logger.info(f"[微信登录] 二维码已下载: {dest_path} ({len(content)} bytes)")
+            return True
+        except Exception as e:
+            logger.warning(f"[微信登录] 二维码下载异常: {e}")
+            return False
+
     # ======== Step 3: 轮询扫码 ========
 
     async def step3_poll_scan(self, uuid: str) -> Optional[str]:

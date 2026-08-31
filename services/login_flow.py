@@ -12,11 +12,13 @@ waiter 拦截（回调内提示"登录进行中"），发送「退出」可取�
 """
 
 import asyncio
+import re
 import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image, Plain
+from astrbot.api.star import StarTools
 from astrbot.core.utils.session_waiter import (
     session_waiter,
     SessionController,
@@ -414,11 +416,29 @@ class LoginFlowManager:
         wechat_state = qr_info["state"]
 
         # Step 3: 发送二维码图片
-        yield event.chain_result([
+        # 优先下载为本地文件发送（Image.fromFileSystem，官方推荐本地路径方式）：
+        # 部分平台适配器（如 QQ 官方 API）无法拉取微信外链图片，会退化为链接。
+        # 下载失败时降级为 URL 图片 + 链接文本兜底，保证用户仍可扫码。
+        qrcode_path = (
+            StarTools.get_data_dir("astrbot_plugin_tronclass")
+            / "qrcode"
+            / f"{re.sub(r'[^\w.-]', '_', user_id or '')}.png"
+        )
+        if await flow.download_qr_image(qr_url, qrcode_path):
+            qr_chain = [Image.fromFileSystem(str(qrcode_path))]
+            fallback_tip = ""
+        else:
+            qr_chain = [Image.fromURL(qr_url)]
+            fallback_tip = f"\n（二维码图片获取失败，可打开链接扫码：{qr_url}）"
+
+        msg_chain = [
             Plain("📱 微信扫码登录\n请用微信扫描下方二维码，扫码后点击确认登录即可"),
-            Image.fromURL(qr_url),
-            Plain("等待自动完成..."),
-        ])
+            *qr_chain,
+        ]
+        if fallback_tip:
+            msg_chain.append(Plain(fallback_tip))
+        msg_chain.append(Plain("等待自动完成..."))
+        yield event.chain_result(msg_chain)
 
         # Step 4: 后台轮询 + 完成登录
         async def _send_notice(msg: str):
