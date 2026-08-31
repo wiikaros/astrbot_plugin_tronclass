@@ -1,5 +1,9 @@
 """插件常量与默认值配置。"""
 
+# 插件标识（与 metadata.yaml name 一致，StarTools.get_data_dir 必须显式传入，
+# 否则框架通过调用栈推断插件名，在 services/ 子模块中会解析失败）
+PLUGIN_NAME = "astrbot_plugin_tronclass"
+
 # ========== 存储 Key ==========
 KV_SESSION_PREFIX = "session"
 KV_SESSION_ORIGIN_PREFIX = "session_origin"

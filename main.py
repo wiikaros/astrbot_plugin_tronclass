@@ -8,6 +8,7 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 
 from .config import (
+    PLUGIN_NAME,
     KV_LOGIN_ATTEMPTS_PREFIX,
     DEFAULT_BASE_URL,
     DEFAULT_HOMEWORK_CHECK_INTERVAL,
@@ -329,7 +330,7 @@ class TronClassPlugin(Star):
 
             # 下载文件
             await evt.send(evt.plain_result("正在下载课表文件..."))
-            ics_dir = StarTools.get_data_dir("astrbot_plugin_tronclass") / "ics"
+            ics_dir = StarTools.get_data_dir(PLUGIN_NAME) / "ics"
             ics_dir.mkdir(parents=True, exist_ok=True)
             # L3：user_id 来自平台 sender_id，先 sanitize 再拼文件名，防路径穿越
             safe_id = re.sub(r"[^\w.-]", "_", user_id or "")

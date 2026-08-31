@@ -29,6 +29,7 @@ from ..api.auth import LoginState, TronClassClient
 from ..api.homework import fetch_homeworks
 from ..api.wechat_login import WeChatLoginFlow
 from ..config import (
+    PLUGIN_NAME,
     LOGIN_STATE_TTL_SECONDS,
     MAX_LOGIN_ATTEMPTS_PER_HOUR,
     KV_LOGIN_ATTEMPTS_PREFIX,
@@ -420,7 +421,7 @@ class LoginFlowManager:
         # 部分平台适配器（如 QQ 官方 API）无法拉取微信外链图片，会退化为链接。
         # 下载失败时降级为 URL 图片 + 链接文本兜底，保证用户仍可扫码。
         qrcode_path = (
-            StarTools.get_data_dir("astrbot_plugin_tronclass")
+            StarTools.get_data_dir(PLUGIN_NAME)
             / "qrcode"
             / f"{re.sub(r'[^\w.-]', '_', user_id or '')}.png"
         )

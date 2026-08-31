@@ -12,6 +12,7 @@ from astrbot.api.star import Star
 
 from .session_cipher import SessionCipher
 from ..config import (
+    PLUGIN_NAME,
     KV_SESSION_PREFIX,
     KV_SESSION_ORIGIN_PREFIX,
     KV_HOMEWORKS_PREFIX,
@@ -45,12 +46,19 @@ class StorageService:
         self._cipher: SessionCipher | None = None
 
     def _get_cipher(self) -> SessionCipher:
-        """懒加载 SessionCipher（默认密钥文件位于插件数据目录）。"""
+        """懒加载 SessionCipher（默认密钥文件位于插件数据目录）。
+
+        必须显式传入 PLUGIN_NAME：AstrBot 的 StarTools.get_data_dir 无参调用
+        会通过调用栈推断插件名，而本方法运行在 services.storage 模块中，
+        框架 star_map 无法解析该模块元数据（RuntimeError: Unable to resolve metadata）。
+        """
         if self._cipher is None:
             if self._key_path is None:
                 from astrbot.api.star import StarTools
 
-                self._key_path = StarTools.get_data_dir() / ".session_key"
+                self._key_path = (
+                    StarTools.get_data_dir(PLUGIN_NAME) / ".session_key"
+                )
             self._cipher = SessionCipher(self._key_path)
         return self._cipher
 
