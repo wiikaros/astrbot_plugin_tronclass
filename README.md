@@ -23,17 +23,6 @@
 
 ## 🚀 快速开始
 
-### 安装
-
-将插件克隆到 AstrBot 的插件目录：
-
-```bash
-cd data/plugins
-git clone https://github.com/wiikaros/astrbot_plugin_tronclass.git
-```
-
-重启 AstrBot 或在 WebUI 插件管理中加载。依赖（`aiohttp` / `icalendar` / `pycryptodome` / `cryptography`）会在加载时自动安装。
-
 ### 首次使用（三步上手）
 
 1. **登录**：在**私聊**中发送 `/微信登录`，扫码确认即可

@@ -6,7 +6,7 @@ desc: >
   支持多用户独立绑定畅课账号，
   自动查询作业列表、检测新作业发布、
   作业截止提醒，以及课表驱动的点名实时通知。
-version: v0.1.0
+version: v1.0.0
 author: wiikaros
 repo: https://github.com/wiikaros/astrbot_plugin_tronclass
 astrbot_version: ">=4.13,<5"
