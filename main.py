@@ -1,6 +1,8 @@
 """AstrBot 畅课（TronClass）插件 — 入口模块。"""
 
 import re
+import time
+from datetime import datetime
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools
@@ -20,8 +22,8 @@ from .api.auth import TronClassClient, SessionInvalidError
 from .api._utils import download_file_http
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from .services.storage import StorageService
-from .services.ics_parser import parse_ics
-from .services.identity import get_user_key
+from .services.ics_parser import parse_ics, is_in_class_now
+from .services.identity import get_user_key, build_friend_origin, resolve_platform_id
 from .services.notifier import format_homework_summary, _fmt_due
 from .services.scheduler import SchedulerService
 from .services.login_flow import LoginFlowManager
@@ -381,6 +383,115 @@ class TronClassPlugin(Star):
             yield event.plain_result("⏰ 上传超时，请重新发送 /上传课表。")
         finally:
             event.stop_event()
+
+    # ========== 命令：/我的状态 ==========
+
+    @filter.command("我的状态")
+    async def cmd_my_status(self, event: AstrMessageEvent):
+        """自查命令（P0-4）：登录态 / 推送目标 / 课表 / 通知开关 / 推送失败计数。
+
+        可选参数 `test`：沿真实推送链路试发一条探针私聊，直接验证通断。
+        仅查发起者自己的数据，不涉及他人隐私。
+        """
+        user_id = self._get_user_id(event)
+        lines = ["📊 **我的状态**", ""]
+
+        # ① 登录态
+        session_data = await self._storage.get_session(user_id)
+        if session_data is None:
+            lines.append("🔐 登录态：❌ 未登录")
+        else:
+            expires_at = session_data.get("expires_at", 0) or 0
+            if expires_at <= 0:
+                lines.append("🔐 登录态：✅ 有效（无过期时间）")
+            else:
+                remain = expires_at - time.time()
+                if remain <= 0:
+                    lines.append("🔐 登录态：⚠️ 已过期（请重新登录）")
+                else:
+                    hours, mins = divmod(int(remain), 3600)
+                    mins //= 60
+                    lines.append(f"🔐 登录态：✅ 有效（剩余 {hours} 小时 {mins} 分）")
+
+        # ② 推送目标
+        origin = await self._storage.get_session_origin(user_id)
+        if not origin:
+            lines.append("📨 推送目标：❌ 无记录（无法主动推送，请重新登录）")
+        else:
+            pid = resolve_platform_id(
+                self.context,
+                origin.get("platform_name", ""),
+                origin.get("platform_id", ""),
+            )
+            if pid:
+                lines.append(f"📨 推送目标：✅ 可推送（platform={pid}）")
+            else:
+                lines.append(
+                    f"📨 推送目标：❌ 解析失败（name={origin.get('platform_name')!r}）"
+                )
+
+        # ③ 课表
+        schedule = await self._storage.get_schedule(user_id)
+        if schedule and schedule.get("courses"):
+            courses = schedule.get("courses", [])
+            in_class = is_in_class_now(schedule, 0)
+            lines.append(
+                f"📅 课表：✅ {len(courses)} 门（学期起始 "
+                f"{schedule.get('semester_start', '未知')}，当前{'上课中' if in_class else '未在上课'}）"
+            )
+        else:
+            lines.append("📅 课表：❌ 未上传（点名检测将按默认间隔轮询）")
+
+        # ④ 通知开关
+        lines.append("🔔 通知开关：")
+        lines.append(
+            f"  - 新作业：{'开' if self._get_config('enable_new_homework_notify', True) else '关'}"
+        )
+        lines.append(
+            f"  - 快到期：{'开' if self._get_config('enable_due_warning', True) else '关'}"
+        )
+        lines.append(
+            f"  - 点名：{'开' if self._get_config('enable_rollcall_notify', True) else '关'}"
+        )
+
+        # ⑤ 推送失败计数
+        fail = await self._storage.get_push_failure(user_id)
+        if fail.get("count", 0) > 0:
+            last = datetime.fromtimestamp(fail.get("last_failed_at", 0)).strftime(
+                "%m-%d %H:%M"
+            )
+            lines.append(f"⚠️ 最近推送失败：{fail['count']} 次（最后失败 {last}）")
+        else:
+            lines.append("✅ 最近推送失败：0 次")
+
+        # 可选探针
+        args = (event.message_str or "").strip().split()
+        if len(args) > 1 and args[1].lower() in ("test", "探针"):
+            probe_ok = False
+            if origin:
+                pid = resolve_platform_id(
+                    self.context,
+                    origin.get("platform_name", ""),
+                    origin.get("platform_id", ""),
+                )
+                if pid:
+                    target = build_friend_origin(pid, origin.get("session_id", ""))
+                    try:
+                        from astrbot.api.event import MessageChain
+                        from astrbot.api.message_components import Plain
+
+                        ok = await self.context.send_message(
+                            target,
+                            MessageChain([Plain("🔍 探针消息：收到说明推送链路正常。")]),
+                        )
+                        probe_ok = bool(ok)
+                    except Exception as e:
+                        logger.error(f"探针发送异常 [{user_id}]：{e}")
+            lines.append(
+                "🧪 探针：✅ 已发送" if probe_ok else "🧪 探针：❌ 发送失败（检查推送目标）"
+            )
+
+        yield event.plain_result("\n".join(lines))
 
     @staticmethod
     async def _try_get_file_url(evt: AstrMessageEvent) -> str | None:

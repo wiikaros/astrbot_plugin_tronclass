@@ -18,6 +18,7 @@ from .storage import StorageService
 from .ics_parser import is_in_class_now
 from .identity import build_friend_origin, resolve_platform_id
 from .notifier import format_multiple_homework_notifications, format_new_rollcall
+from ..config import PUSH_FAIL_THRESHOLD, PUSH_FAIL_NOTIFY_COOLDOWN
 
 
 class SchedulerService:
@@ -311,12 +312,16 @@ class SchedulerService:
         推送目标 = 登录时保存的 {platform_name, platform_id, session_id}，
         推送时按平台类型名重解析当前适配器实例 id（适配器重建后自愈），
         并以 FriendMessage 私聊会话发送，杜绝推送到群的可能。
+
+        失败可观测（P0-4）：无目标/解析失败/发送失败/未送达均计入失败计数，
+        连续失败达阈值且超过冷却期 → 主动提示用户重新登录，不再静默。
         """
         origin = await self._storage.get_session_origin(user_id)
         if not origin:
             logger.warning(
                 f"用户 {user_id} 无推送目标记录（origin），无法推送定时通知，请重新登录"
             )
+            await self._record_push_failure(user_id)
             return
 
         platform_id = resolve_platform_id(
@@ -328,6 +333,7 @@ class SchedulerService:
             logger.warning(
                 f"用户 {user_id} 平台解析失败（name={origin.get('platform_name')!r}），无法推送"
             )
+            await self._record_push_failure(user_id)
             return
 
         from astrbot.api.event import MessageChain
@@ -340,9 +346,45 @@ class SchedulerService:
             )
         except Exception as e:
             logger.error(f"发送私聊消息失败 [{user_id}]：{e}")
+            await self._record_push_failure(user_id)
             return
         if not ok:
             # 平台不匹配：send_message 返回 False 而非抛异常（context.py:471-478）
             logger.error(
                 f"发送私聊消息未送达 [{user_id}]：平台未匹配目标 {target}"
             )
+            await self._record_push_failure(user_id)
+            return
+        await self._storage.clear_push_failure(user_id)
+
+    async def _record_push_failure(self, user_id: str):
+        """推送失败计数 + 阈值触发一次性用户提示（P0-4）。"""
+        await self._storage.record_push_failure(user_id)
+        rec = await self._storage.get_push_failure(user_id)
+        now = time.time()
+        if rec.get("count", 0) < PUSH_FAIL_THRESHOLD:
+            return
+        if now - rec.get("last_notified_at", 0) < PUSH_FAIL_NOTIFY_COOLDOWN:
+            return
+        await self._storage.mark_push_fail_notified(user_id)
+        try:
+            origin = await self._storage.get_session_origin(user_id)
+            if origin:
+                pid = resolve_platform_id(
+                    self._context,
+                    origin.get("platform_name", ""),
+                    origin.get("platform_id", ""),
+                )
+                if pid:
+                    target = build_friend_origin(pid, origin.get("session_id", ""))
+                    from astrbot.api.event import MessageChain
+                    from astrbot.api.message_components import Plain
+
+                    await self._context.send_message(
+                        target,
+                        MessageChain(
+                            [Plain("⚠️ 定时推送多次失败，请重新登录，或发送 /我的状态 检查。")]
+                        ),
+                    )
+        except Exception as e:
+            logger.warning(f"推送失败提示发送失败 [{user_id}]：{e}")

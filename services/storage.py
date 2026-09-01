@@ -23,6 +23,8 @@ from ..config import (
     KV_LOGIN_STATE_INDEX,
     KV_LAST_ROLLCALL_CHECK_PREFIX,
     KV_ALL_LOGGED_IN_USERS,
+    KV_PUSH_FAIL_PREFIX,
+    KV_DUE_NOTIFIED_PREFIX,
 )
 
 # Session 存储格式版本（v2 = Fernet 密文）
@@ -295,3 +297,49 @@ class StorageService:
     async def set_last_rollcall_time(self, user_id: str, timestamp: int) -> None:
         """记录用户上次点名检测的时间戳。"""
         await self._plugin.put_kv_data(f"{KV_LAST_ROLLCALL_CHECK_PREFIX}:{user_id}", timestamp)
+
+    # ========== 推送失败计数（P0-4） ==========
+
+    async def record_push_failure(self, user_id: str) -> None:
+        """记录一次推送失败（count +1，刷新 last_failed_at）。"""
+        key = f"{KV_PUSH_FAIL_PREFIX}:{user_id}"
+        rec = await self._plugin.get_kv_data(key, default=None)
+        if not isinstance(rec, dict):
+            rec = {}
+        now = time.time()
+        rec["count"] = int(rec.get("count", 0)) + 1
+        rec["last_failed_at"] = now
+        await self._plugin.put_kv_data(key, rec)
+
+    async def clear_push_failure(self, user_id: str) -> None:
+        """推送成功后清零计数。"""
+        await self._plugin.delete_kv_data(f"{KV_PUSH_FAIL_PREFIX}:{user_id}")
+
+    async def get_push_failure(self, user_id: str) -> dict:
+        """获取推送失败计数（无记录时返回全零结构）。"""
+        rec = await self._plugin.get_kv_data(f"{KV_PUSH_FAIL_PREFIX}:{user_id}", default=None)
+        if isinstance(rec, dict):
+            return rec
+        return {"count": 0, "last_failed_at": 0, "last_notified_at": 0}
+
+    async def mark_push_fail_notified(self, user_id: str) -> None:
+        """记录"已向用户提示过推送失败"的时间戳（冷却期内不重复提示）。"""
+        key = f"{KV_PUSH_FAIL_PREFIX}:{user_id}"
+        rec = await self._plugin.get_kv_data(key, default={})
+        if not isinstance(rec, dict):
+            rec = {}
+        rec["last_notified_at"] = time.time()
+        await self._plugin.put_kv_data(key, rec)
+
+    # ========== 快到期去重（P0-1） ==========
+
+    async def get_due_notified(self, user_id: str) -> dict:
+        """获取快到期已通知记录：{hw_id: {"level": int, "at": float}}。"""
+        raw = await self._plugin.get_kv_data(
+            f"{KV_DUE_NOTIFIED_PREFIX}:{user_id}", default={}
+        )
+        return raw if isinstance(raw, dict) else {}
+
+    async def save_due_notified(self, user_id: str, data: dict) -> None:
+        """保存快到期已通知记录。"""
+        await self._plugin.put_kv_data(f"{KV_DUE_NOTIFIED_PREFIX}:{user_id}", data)

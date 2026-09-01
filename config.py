@@ -15,6 +15,14 @@ KV_LOGIN_STATE_INDEX = "_login_state_index"      # 进行中登录索引（启�
 KV_LAST_ROLLCALL_CHECK_PREFIX = "_last_rollcall_check"
 KV_ALL_LOGGED_IN_USERS = "_all_logged_in_users"   # 已登录用户注册表（定时任务遍历用）
 KV_LOGIN_ATTEMPTS_PREFIX = "_login_attempts"      # 登录频率限制
+KV_PUSH_FAIL_PREFIX = "_push_fail"                # 推送失败计数（P0-4）
+KV_DUE_NOTIFIED_PREFIX = "_due_notified"          # 快到期已通知记录（P0-1）
+
+# ========== 推送与去重（P0-1/P0-4） ==========
+PUSH_FAIL_THRESHOLD = 3                 # 连续推送失败阈值
+PUSH_FAIL_NOTIFY_COOLDOWN = 3600        # 失败提示冷却（秒），防每轮轰炸
+DUE_WARN_INNER_LEVELS_HOURS = (6, 1)    # 快到期内部分级（小时），最外层用 homework_due_warn_hours
+DUE_NOTIFIED_MAX_ENTRIES = 200          # 去重记录容量上限（防 KV 膨胀）
 
 # ========== 登录相关 ==========
 LOGIN_STATE_TTL_SECONDS = 300          # 登录状态超时（5 分钟）
