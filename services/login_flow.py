@@ -368,7 +368,10 @@ class LoginFlowManager:
         await self._plugin._storage.save_session(user_id, session_data)
         await self._plugin._storage.register_user(user_id)
         await self._plugin._storage.save_session_origin(
-            user_id, getattr(evt, "unified_msg_origin", "") or ""
+            user_id,
+            evt.get_platform_name(),
+            evt.get_platform_id(),
+            getattr(evt, "session_id", "") or evt.get_sender_id(),
         )
 
         # 登录成功即拉取一次作业，保证 /作业列表 立即可查
@@ -398,7 +401,6 @@ class LoginFlowManager:
 
         base_url = plugin._get_base_url()
         flow = WeChatLoginFlow(base_url)
-        session_key = getattr(event, "unified_msg_origin", "") or getattr(event, "session", "")
 
         # Step 1: 初始化 CAS session
         yield event.plain_result("🔐 正在准备微信登录，请稍候...")
@@ -446,10 +448,17 @@ class LoginFlowManager:
         yield event.chain_result(msg_chain)
 
         # Step 4: 后台轮询 + 完成登录
+        def _build_notify_target() -> str:
+            """构建登录进度通知的私聊目标（FriendMessage，杜绝推送到群，P0-2）。"""
+            return build_friend_origin(
+                event.get_platform_id(),
+                getattr(event, "session_id", "") or event.get_sender_id(),
+            )
+
         async def _send_notice(msg: str):
             try:
                 await plugin.context.send_message(
-                    session_key, MessageChain([Plain(msg)])
+                    _build_notify_target(), MessageChain([Plain(msg)])
                 )
             except Exception as e:
                 logger.error(f"[微信登录] 发送通知失败: {e}")
@@ -470,7 +479,12 @@ class LoginFlowManager:
 
                 await plugin._storage.save_session(user_id, session_data)
                 await plugin._storage.register_user(user_id)
-                await plugin._storage.save_session_origin(user_id, session_key)
+                await plugin._storage.save_session_origin(
+                    user_id,
+                    event.get_platform_name(),
+                    event.get_platform_id(),
+                    getattr(event, "session_id", "") or event.get_sender_id(),
+                )
 
                 # 校验 session 有效性 + 顺手拉取一次作业（失败不影响登录）
                 try:

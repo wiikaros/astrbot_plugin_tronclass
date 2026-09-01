@@ -5,6 +5,7 @@
 """
 
 from pathlib import Path
+import time
 from typing import Optional, List
 
 from astrbot.api import logger
@@ -102,18 +103,79 @@ class StorageService:
         """删除用户 session。"""
         await self._plugin.delete_kv_data(f"{KV_SESSION_PREFIX}:{user_id}")
 
-    async def save_session_origin(self, user_id: str, origin: str) -> None:
-        """记录用户的会话源（unified_msg_origin），供定时任务主动推送使用。"""
-        if not origin:
-            return
-        await self._plugin.put_kv_data(f"{KV_SESSION_ORIGIN_PREFIX}:{user_id}", origin)
+    async def save_session_origin(
+        self,
+        user_id: str,
+        platform_name: str,
+        platform_id: str,
+        session_id: str,
+    ) -> None:
+        """记录用户的私聊推送目标（结构化描述，P0-2/P0-4 修复）。
 
-    async def get_session_origin(self, user_id: str) -> Optional[str]:
-        """获取用户的会话源（unified_msg_origin）。"""
-        origin = await self._plugin.get_kv_data(
+        不再保存 unified_msg_origin 字符串（内嵌适配器实例 id，重建即失效；
+        群聊时为群会话，会广播个人通知）。空值不再静默丢弃，写日志告警。
+        """
+        if not platform_id or not session_id:
+            logger.warning(
+                f"[storage] 推送目标信息不完整，未保存 "
+                f"(user_id={user_id}, platform_id={platform_id!r}, session_id={session_id!r})"
+            )
+            return
+        await self._plugin.put_kv_data(
+            f"{KV_SESSION_ORIGIN_PREFIX}:{user_id}",
+            {
+                "platform_name": platform_name or "",
+                "platform_id": platform_id,
+                "session_id": session_id,
+                "saved_at": time.time(),
+            },
+        )
+
+    async def get_session_origin(self, user_id: str) -> Optional[dict]:
+        """获取用户的私聊推送目标描述。
+
+        旧格式（str unified_msg_origin）惰性迁移：
+        - FriendMessage → 转换并存回新格式；
+        - GroupMessage（P0-2 污染）→ 丢弃 + warning，返回 None。
+        """
+        raw = await self._plugin.get_kv_data(
             f"{KV_SESSION_ORIGIN_PREFIX}:{user_id}", default=None
         )
-        return origin if isinstance(origin, str) else None
+        if raw is None:
+            return None
+        if isinstance(raw, dict) and "platform_id" in raw and "session_id" in raw:
+            return raw
+        if isinstance(raw, str):
+            migrated = self._migrate_legacy_origin(raw)
+            if migrated is None:
+                logger.warning(
+                    f"[storage] 旧 origin 为群聊/非法条目，已丢弃（user_id={user_id}，请重新登录）"
+                )
+                return None
+            await self.save_session_origin(
+                user_id,
+                migrated["platform_name"],
+                migrated["platform_id"],
+                migrated["session_id"],
+            )
+            return migrated
+        logger.warning(f"[storage] origin 数据形态异常，已忽略（user_id={user_id}）")
+        return None
+
+    @staticmethod
+    def _migrate_legacy_origin(origin: str) -> Optional[dict]:
+        """解析旧 unified_msg_origin；非 FriendMessage（群聊污染）返回 None。"""
+        try:
+            pid, mtype, sid = origin.split(":", 2)
+        except (ValueError, AttributeError):
+            return None
+        if mtype != "FriendMessage":
+            return None
+        return {
+            "platform_name": "",
+            "platform_id": pid,
+            "session_id": sid,
+        }
 
     async def get_all_session_user_ids(self) -> List[str]:
         """获取所有已登录用户的 user_id 列表。"""

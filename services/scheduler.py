@@ -16,6 +16,7 @@ from ..api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from ..api.rollcall import fetch_rollcalls, detect_new_rollcalls
 from .storage import StorageService
 from .ics_parser import is_in_class_now
+from .identity import build_friend_origin, resolve_platform_id
 from .notifier import format_multiple_homework_notifications, format_new_rollcall
 
 
@@ -305,25 +306,43 @@ class SchedulerService:
     # ========== 通知发送 ==========
 
     async def _send_private_notification(self, user_id: str, message: str):
-        """给指定用户发送私聊通知（官方 context.send_message API，框架合规 C5）。
+        """给指定用户发送私聊通知（P0-2/P0-4 修复：不存群会话、按 name 自愈）。
 
-        依赖登录成功时保存的 unified_msg_origin（session_origin）。
-        老用户无该记录时无法主动推送，记录 warning 引导重新登录。
+        推送目标 = 登录时保存的 {platform_name, platform_id, session_id}，
+        推送时按平台类型名重解析当前适配器实例 id（适配器重建后自愈），
+        并以 FriendMessage 私聊会话发送，杜绝推送到群的可能。
         """
+        origin = await self._storage.get_session_origin(user_id)
+        if not origin:
+            logger.warning(
+                f"用户 {user_id} 无推送目标记录（origin），无法推送定时通知，请重新登录"
+            )
+            return
+
+        platform_id = resolve_platform_id(
+            self._context,
+            origin.get("platform_name", ""),
+            origin.get("platform_id", ""),
+        )
+        if not platform_id:
+            logger.warning(
+                f"用户 {user_id} 平台解析失败（name={origin.get('platform_name')!r}），无法推送"
+            )
+            return
+
+        from astrbot.api.event import MessageChain
+        from astrbot.api.message_components import Plain
+
+        target = build_friend_origin(platform_id, origin.get("session_id", ""))
         try:
-            origin = await self._storage.get_session_origin(user_id)
-            if not origin:
-                logger.warning(
-                    f"用户 {user_id} 无会话源记录（unified_msg_origin），"
-                    f"无法推送定时通知，请重新登录"
-                )
-                return
-
-            from astrbot.api.event import MessageChain
-            from astrbot.api.message_components import Plain
-
-            await self._context.send_message(
-                origin, MessageChain([Plain(message)])
+            ok = await self._context.send_message(
+                target, MessageChain([Plain(message)])
             )
         except Exception as e:
             logger.error(f"发送私聊消息失败 [{user_id}]：{e}")
+            return
+        if not ok:
+            # 平台不匹配：send_message 返回 False 而非抛异常（context.py:471-478）
+            logger.error(
+                f"发送私聊消息未送达 [{user_id}]：平台未匹配目标 {target}"
+            )
