@@ -28,6 +28,7 @@ from astrbot.core.utils.session_waiter import (
 from ..api.auth import LoginState, TronClassClient
 from ..api.homework import fetch_homeworks
 from ..api.wechat_login import WeChatLoginFlow
+from ..services.identity import build_friend_origin, get_user_key
 from ..config import (
     PLUGIN_NAME,
     LOGIN_STATE_TTL_SECONDS,
@@ -41,15 +42,18 @@ class PrivateChatSessionFilter(SessionFilter):
 
     部分平台私聊/群聊的 sender_id 可能相同，若不隔离，
     群聊中的普通消息会被当作登录输入（如误把群聊内容当密码）。
+
+    P0-3：匹配 key 使用统一用户标识（platform_id:sender_id），
+    避免跨平台同号 sender_id 串会话。
     """
 
     def filter(self, event: AstrMessageEvent) -> str:
         try:
             gid = event.get_group_id()
             if gid is None or gid == "":
-                return event.get_sender_id()
+                return get_user_key(event)
         except Exception:
-            return event.get_sender_id()
+            return get_user_key(event)
         return ""
 
 
@@ -121,7 +125,7 @@ class LoginFlowManager:
         最终由外层 finally 的 cleanup_login() 统一 close client + 删 KV。
         """
         plugin = self._plugin
-        user_id = event.get_sender_id()
+        user_id = plugin._get_user_id(event)
 
         # ---- 前置守卫 ----
         if not plugin._is_private_chat(event):
@@ -153,7 +157,7 @@ class LoginFlowManager:
 
             @session_waiter(timeout=LOGIN_STATE_TTL_SECONDS, record_history_chains=False)
             async def login_flow(controller: SessionController, evt: AstrMessageEvent):
-                uid = evt.get_sender_id()
+                uid = plugin._get_user_id(evt)
                 text = (evt.message_str or "").strip()
 
                 # ---- 会话控制关键字 ----
@@ -384,7 +388,7 @@ class LoginFlowManager:
     async def start_wechat_login(self, event: AstrMessageEvent):
         """微信扫码登录全流程（async generator，保持后台 asyncio.Task 轮询架构）。"""
         plugin = self._plugin
-        user_id = event.get_sender_id()
+        user_id = plugin._get_user_id(event)
 
         # 取消旧的轮询任务
         old_task = self._wechat_tasks.get(user_id)

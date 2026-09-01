@@ -21,6 +21,7 @@ from .api._utils import download_file_http
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from .services.storage import StorageService
 from .services.ics_parser import parse_ics
+from .services.identity import get_user_key
 from .services.notifier import format_homework_summary, _fmt_due
 from .services.scheduler import SchedulerService
 from .services.login_flow import LoginFlowManager
@@ -67,8 +68,8 @@ class TronClassPlugin(Star):
         return self.config.get(key, default)
 
     def _get_user_id(self, event: AstrMessageEvent) -> str:
-        """获取当前用户唯一标识。"""
-        return event.get_sender_id()
+        """获取当前用户唯一标识（P0-3：platform_id:sender_id，全链路唯一入口）。"""
+        return get_user_key(event)
 
     def _is_private_chat(self, event: AstrMessageEvent) -> bool:
         """判断是否为私聊会话。"""
