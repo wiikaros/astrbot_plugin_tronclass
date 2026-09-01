@@ -216,14 +216,17 @@ def filter_notified_imminent(
         crossed = [lv for lv in levels if now >= due_dt - timedelta(hours=lv)]
         if not crossed:
             continue  # 未进入最外层窗口
-        max_level = crossed[0]  # levels 降序，首个即最高已跨级别
+        # 当前级别 = 最近被跨过的级别（数值最小者）。
+        # 例：剩 23h → 已跨 24h 级（24）；剩 5h → 已跨 24/6 级，最近是 6；
+        # 剩 0.5h → 已跨 24/6/1 级，最近是 1。
+        current_level = min(crossed)
         prev = notified.get(hw_id)
         prev_level = prev.get("level") if isinstance(prev, dict) else None
-        if prev_level == max_level:
+        if prev_level == current_level:
             updated[hw_id] = prev  # 同级已推过，保持记录
             continue
         to_notify.append(hw)
-        updated[hw_id] = {"level": max_level, "at": now.timestamp()}
+        updated[hw_id] = {"level": current_level, "at": now.timestamp()}
 
     # 容量裁剪（按 at 升序删除最旧）
     if len(updated) > DUE_NOTIFIED_MAX_ENTRIES:
