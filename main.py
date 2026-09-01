@@ -25,6 +25,7 @@ from .services.identity import get_user_key
 from .services.notifier import format_homework_summary, _fmt_due
 from .services.scheduler import SchedulerService
 from .services.login_flow import LoginFlowManager
+from .services.migration import migrate_legacy_kv
 
 
 class TronClassPlugin(Star):
@@ -132,6 +133,12 @@ class TronClassPlugin(Star):
             # 定时任务注册失败不阻塞插件加载，仅降级（无自动通知）
             logger.error(f"定时任务初始化失败，自动通知功能将不可用：{e}")
             self._scheduler = None
+
+        # P0-3/P0-4：存量 KV 迁移（幂等，单平台场景；失败不影响加载，下次启动自愈）
+        try:
+            await migrate_legacy_kv(self)
+        except Exception as e:
+            logger.warning(f"存量数据迁移异常（不影响加载）: {e}")
 
         # 启动清扫：进程重启后内存登录会话已失（session_waiter 为内存态），
         # 残留的 login_state KV 无法续传，统一清理（不涉及 _login_attempts 频率限制）
