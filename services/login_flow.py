@@ -393,6 +393,16 @@ class LoginFlowManager:
         plugin = self._plugin
         user_id = plugin._get_user_id(event)
 
+        # ---- 前置守卫（P0-2：与密码登录 :127-134 对称；守卫在限流之前，群聊刷命令不消耗限流）----
+        if not plugin._is_private_chat(event):
+            yield event.plain_result(
+                "🔐 微信登录涉及账号绑定，请在**私聊**中发送 /微信登录"
+            )
+            return
+        if not await self.check_login_rate_limit(user_id):
+            yield event.plain_result("⚠️ 登录尝试过于频繁，请 1 小时后再试。")
+            return
+
         # 取消旧的轮询任务
         old_task = self._wechat_tasks.get(user_id)
         if old_task and not old_task.done():
