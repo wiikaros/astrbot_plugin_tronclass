@@ -12,7 +12,11 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 
 from ..api.auth import TronClassClient, check_session_valid
-from ..api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
+from ..api.homework import (
+    fetch_homeworks,
+    diff_homeworks,
+    filter_notified_imminent,
+)
 from ..api.rollcall import fetch_rollcalls, detect_new_rollcalls
 from .storage import StorageService
 from .ics_parser import is_in_class_now
@@ -196,10 +200,15 @@ class SchedulerService:
             diff = diff_homeworks(cached, fresh)
             await self._storage.save_homeworks(user_id, fresh)
 
-            # 检查快到期
+            # 检查快到期（P0-1：分级去重，24h/6h/1h 各推一次）
             imminent = []
             if self._enable_due_warning:
-                imminent = get_imminent_due(fresh, self._due_warn_hours)
+                notified = await self._storage.get_due_notified(user_id)
+                to_notify, new_notified = filter_notified_imminent(
+                    fresh, self._due_warn_hours, notified
+                )
+                await self._storage.save_due_notified(user_id, new_notified)
+                imminent = to_notify
 
             added = diff["added"] if self._enable_homework_notify else []
 

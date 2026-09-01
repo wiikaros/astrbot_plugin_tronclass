@@ -126,7 +126,10 @@ def get_imminent_due(
     homeworks: List[dict],
     warn_hours: int = 24,
 ) -> List[dict]:
-    """筛选快到期但未提交的作业。"""
+    """筛选快到期但未提交的作业（无状态筛选，交互式查询用）。
+
+    定时推送请用 `filter_notified_imminent`（P0-1：分级去重）。
+    """
     from ._utils import parse_datetime
 
     now = datetime.now()
@@ -148,3 +151,84 @@ def get_imminent_due(
 
     imminent.sort(key=lambda h: h.get("due_at", ""))
     return imminent
+
+
+def due_warn_levels(warn_hours: int) -> tuple:
+    """计算分级提醒阈值（小时，降序）。
+
+    最外层取配置的 `warn_hours`，内部分级取 `DUE_WARN_INNER_LEVELS_HOURS` 中
+    严格小于 `warn_hours` 的项——防止配置阈值小于内级时"未进窗口先标记大级"。
+    例：warn_hours=24 → (24, 6, 1)；warn_hours=4 → (4, 1)。
+    """
+    from ..config import DUE_WARN_INNER_LEVELS_HOURS
+
+    warn = int(warn_hours)
+    levels = [warn] + [lv for lv in DUE_WARN_INNER_LEVELS_HOURS if lv < warn]
+    return tuple(sorted(levels, reverse=True))
+
+
+def filter_notified_imminent(
+    homeworks: List[dict],
+    warn_hours: int,
+    notified: dict,
+) -> tuple:
+    """快到期分级去重筛选（P0-1）。
+
+    规则：
+    - 对每门未提交且有 due 的作业，取"当前已跨过的最高级别"（now >= due - level*h）；
+    - 与已通知记录同级 → 跳过（每级只推一次）；
+    - 跨到更低级别 → 通知并更新记录（24h/6h/1h 各一次）；
+    - 作业消失 / 已提交 / 已过期 → 清理记录；
+    - 记录容量超上限 → 按时间裁剪最旧（防 KV 膨胀）。
+
+    Args:
+        homeworks: 最新作业列表（fresh）。
+        warn_hours: 最外层提醒阈值（小时）。
+        notified: 已通知记录 {hw_id: {"level": int, "at": float}}。
+
+    Returns:
+        (to_notify: List[dict], updated: dict)
+    """
+    from ._utils import parse_datetime
+    from ..config import DUE_NOTIFIED_MAX_ENTRIES
+
+    now = datetime.now()
+    levels = due_warn_levels(warn_hours)
+    notified = notified if isinstance(notified, dict) else {}
+
+    # 当前在列表中的有效作业（未提交、有 due、未过期）
+    valid = {}
+    for hw in homeworks:
+        hw_id = hw.get("id")
+        if hw_id is None:
+            continue
+        status = hw.get("status", "")
+        if status in ("已提交", "已完成", "submitted", "graded"):
+            continue
+        due_dt = parse_datetime(hw.get("due_at", "")) if hw.get("due_at") else None
+        if not due_dt or now >= due_dt:
+            continue
+        valid[str(hw_id)] = (hw, due_dt)
+
+    to_notify = []
+    updated = {}
+    for hw_id, (hw, due_dt) in valid.items():
+        crossed = [lv for lv in levels if now >= due_dt - timedelta(hours=lv)]
+        if not crossed:
+            continue  # 未进入最外层窗口
+        max_level = crossed[0]  # levels 降序，首个即最高已跨级别
+        prev = notified.get(hw_id)
+        prev_level = prev.get("level") if isinstance(prev, dict) else None
+        if prev_level == max_level:
+            updated[hw_id] = prev  # 同级已推过，保持记录
+            continue
+        to_notify.append(hw)
+        updated[hw_id] = {"level": max_level, "at": now.timestamp()}
+
+    # 容量裁剪（按 at 升序删除最旧）
+    if len(updated) > DUE_NOTIFIED_MAX_ENTRIES:
+        excess = len(updated) - DUE_NOTIFIED_MAX_ENTRIES
+        for old_id in sorted(updated, key=lambda k: updated[k].get("at", 0))[:excess]:
+            del updated[old_id]
+
+    return to_notify, updated

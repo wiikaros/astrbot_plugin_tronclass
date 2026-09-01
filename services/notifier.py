@@ -79,9 +79,13 @@ def format_multiple_homework_notifications(
     added: List[dict], imminent: List[dict]
 ) -> List[str]:
     messages = []
+    added_ids = {str(hw.get("id")) for hw in added if hw.get("id") is not None}
     for hw in added:
         messages.append(format_new_homework(hw))
     for hw in imminent:
+        # P0-1：同轮双推修复——新作业消息已含截止时间，imminent 中同 id 条目跳过
+        if hw.get("id") is not None and str(hw.get("id")) in added_ids:
+            continue
         due_dt = parse_datetime(hw.get("due_at", ""))
         remaining = due_dt - datetime.now() if due_dt else None
         hours = max(0, int(remaining.total_seconds() / 3600)) if remaining else 0
