@@ -127,6 +127,11 @@ class SchedulerService:
         if session_data is None:
             return None
         client = TronClassClient.from_session_data(session_data)
+        # 注入写回：服务器每次响应滚动续期 session/role_token（并回传 x-session-id），
+        # 由 client 在请求后经节流把最新凭证持久化，保证跨 tick 不退回旧 cookie
+        client.attach_session_persister(
+            lambda data: self._storage.save_session(user_id, data)
+        )
         if not await self._check_session_valid_cached(user_id, client):
             logger.info(f"Session 已过期 [{user_id}]，清理并通知用户")
             await self._storage.delete_session(user_id)

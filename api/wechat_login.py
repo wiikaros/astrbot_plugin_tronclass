@@ -8,6 +8,7 @@
 """
 
 import re
+import time
 import asyncio
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, quote
@@ -15,7 +16,7 @@ from urllib.parse import urlparse, parse_qs, quote
 import aiohttp
 from astrbot.api import logger
 
-from ._utils import decode_jwt_expiry
+from ._utils import decode_jwt_expiry, filter_cookies_for_base
 from ..config import (
     WECHAT_POLL_URL,
     WECHAT_POLL_INTERVAL,
@@ -260,10 +261,8 @@ class WeChatLoginFlow:
                 logger.error(f"[微信登录] 未到达 TronClass: {final_url[:100]}")
                 return None
 
-            # 提取 session cookies
-            cookies = {}
-            for cookie in self._session.cookie_jar:
-                cookies[cookie.key] = cookie.value
+            # 提取 session cookies（仅保留会随 base_url 发送的业务域 cookie）
+            cookies = filter_cookies_for_base(self._session.cookie_jar, self.base_url)
 
             session_id = cookies.get("session", "")
             role_token = cookies.get("role_token", "")
@@ -276,6 +275,8 @@ class WeChatLoginFlow:
                 "role_token": role_token,
                 "base_url": self.base_url,
                 "expires_at": expires_at,
+                "created_at": time.time(),
+                "updated_at": time.time(),
             }
             logger.info(f"[微信登录] ✅ 成功，session_id_len={len(session_id)}")
             return session_data

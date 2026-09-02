@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from yarl import URL
+
 # 部署环境统一按东八区解释（UTC 输入 → 本地 naive）
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -77,6 +79,32 @@ def parse_datetime(s: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def filter_cookies_for_base(jar, base_url: str) -> dict:
+    """提取“会随 base_url 发送”的全部 cookie（host/domain/path 均匹配）。
+
+    登录与业务期统一用此函数快照 aiohttp CookieJar：
+    - 只保留业务域名下实际有效的 cookie（如 courses 域的 session/role_token），
+    - 丢弃 sso / identity 等无关域 cookie，避免其被平铺后错误回放。
+
+    与恢复端 aiohttp CookieJar.update_cookies(dict, URL(base_url)) 语义自洽：
+    快照 → 恢复 round-trip 后，再次 filter 结果等价。
+
+    Args:
+        jar: aiohttp.CookieJar 实例。
+        base_url: 业务基准 URL（如 https://courses.cuc.edu.cn）。
+
+    Returns:
+        {cookie_name: value}，仅含会随 base_url 请求发送的 cookie。
+    """
+    try:
+        return {
+            m.key: m.value
+            for m in jar.filter_cookies(URL(base_url)).values()
+        }
+    except Exception:
+        return {}
 
 
 async def download_file_http(

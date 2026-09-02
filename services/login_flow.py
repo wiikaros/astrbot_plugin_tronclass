@@ -499,6 +499,9 @@ class LoginFlowManager:
                 # 校验 session 有效性 + 顺手拉取一次作业（失败不影响登录）
                 try:
                     client = TronClassClient.from_session_data(session_data)
+                    client.attach_session_persister(
+                        lambda data: plugin._storage.save_session(user_id, data)
+                    )
                     valid = await client.verify_session()
                     if valid:
                         try:

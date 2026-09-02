@@ -92,6 +92,11 @@ class TronClassPlugin(Star):
         if session_data is None:
             return None
         client = TronClassClient.from_session_data(session_data)
+        # 注入写回：响应中服务器滚动续期的 session/role_token/x-session-id
+        # 由 client 在请求后经节流持久化，手动命令同样参与会话续期
+        client.attach_session_persister(
+            lambda data: self._storage.save_session(user_id, data)
+        )
         if client.is_expired:
             await client.close()
             return None

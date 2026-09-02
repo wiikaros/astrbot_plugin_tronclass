@@ -26,7 +26,7 @@ import aiohttp
 from yarl import URL
 from astrbot.api import logger
 
-from ._utils import decode_jwt_expiry
+from ._utils import decode_jwt_expiry, filter_cookies_for_base
 from ..config import (
     ENDPOINT_TODOS,
     ENDPOINT_ROLLCALLS,
@@ -53,6 +53,17 @@ AES_CHARS = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678"
 def _random_string(n: int) -> str:
     """与 CUC encrypt.js randomString 同字符集的随机串。"""
     return "".join(secrets.choice(AES_CHARS) for _ in range(n))
+
+
+def _cookie_value_ci(cookies: dict, name: str, default: str = "") -> str:
+    """大小写不敏感地从 cookie 字典取值（cookie 名理论上区分大小写）。
+
+    服务器固定下发小写 `session`/`role_token`，此处兼容任意大小写防御变化。
+    """
+    for k, v in cookies.items():
+        if k.lower() == name.lower():
+            return v
+    return default
 
 
 def encrypt_password(password: str, salt: str) -> str:
@@ -108,13 +119,18 @@ class LoginState:
 
 @dataclass
 class TronClassSession:
-    """已登录的畅课会话。"""
+    """已登录的畅课会话。
+
+    cookies 仅包含“会随 base_url 发送”的业务域 cookie（见 filter_cookies_for_base），
+    不再混入 sso/identity 等无关域条目。
+    """
     cookies: Dict[str, str] = field(default_factory=dict)
     session_id: str = ""
     role_token: str = ""
     base_url: str = ""
     expires_at: float = 0.0       # 预估过期时间戳
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)  # 最近一次凭证刷新/同步时刻
 
 
 class TronClassClient:
@@ -128,6 +144,9 @@ class TronClassClient:
         self.base_url = base_url.rstrip("/")
         self._session: Optional[aiohttp.ClientSession] = None
         self._tron_session: Optional[TronClassSession] = None
+        # 会话凭证写回回调（由创建方注入，如 storage.save_session 闭包）
+        self._writeback: Optional[callable] = None
+        self._last_persist_at: float = 0.0
 
     async def _ensure_session(self):
         """确保 HTTP session 已创建。"""
@@ -147,6 +166,15 @@ class TronClassClient:
             await self._session.close()
             self._session = None
 
+    def attach_session_persister(self, callback: callable) -> None:
+        """注入会话凭证写回回调。
+
+        回调签名为 async (data: dict) -> None，data 为 get_session_data() 输出。
+        每次响应带新 cookie / 新 x-session-id（会话被服务器滚动续期）时，
+        经节流后调用，用于把最新凭证持久化回 KV。
+        """
+        self._writeback = callback
+
     def get_session_data(self) -> Optional[dict]:
         """导出当前 session 数据（用于 KV 存储）。"""
         if self._tron_session is None:
@@ -158,19 +186,22 @@ class TronClassClient:
             "base_url": self.base_url,
             "expires_at": self._tron_session.expires_at,
             "created_at": self._tron_session.created_at,
+            "updated_at": self._tron_session.updated_at,
         }
 
     @classmethod
     def from_session_data(cls, data: dict) -> "TronClassClient":
         """从 KV 存储的 session 数据恢复客户端。"""
         client = cls(base_url=data.get("base_url", ""))
+        created_at = data.get("created_at", 0.0)
         client._tron_session = TronClassSession(
             cookies=data.get("cookies", {}),
             session_id=data.get("session_id", ""),
             role_token=data.get("role_token", ""),
             base_url=data.get("base_url", ""),
             expires_at=data.get("expires_at", 0.0),
-            created_at=data.get("created_at", 0.0),
+            created_at=created_at,
+            updated_at=data.get("updated_at", created_at or time.time()),
         )
         return client
 
@@ -542,16 +573,14 @@ class TronClassClient:
         return url, ""
 
     async def _extract_session_from_response(self):
-        """从 aiohttp CookieJar 提取全部 cookie（跨域），并取 session/role_token。"""
-        cookies = {}
-        session_id = ""
-        role_token = ""
-        for morsel in self._session.cookie_jar:
-            cookies[morsel.key] = morsel.value
-            if morsel.key.lower() == "session":
-                session_id = morsel.value
-            elif morsel.key.lower() == "role_token":
-                role_token = morsel.value
+        """从 aiohttp CookieJar 提取业务域 cookie，并取 session/role_token。
+
+        仅保留会随 base_url 发送的 cookie（filter_cookies_for_base），
+        避免把 sso/identity 域 cookie 平铺后错配到业务域。
+        """
+        cookies = filter_cookies_for_base(self._session.cookie_jar, self.base_url)
+        session_id = _cookie_value_ci(cookies, "session")
+        role_token = _cookie_value_ci(cookies, "role_token")
 
         # 估算过期时间（role_token 是 JWT，含 exp 字段）
         expires_at = decode_jwt_expiry(role_token) if role_token else 0.0
@@ -563,6 +592,66 @@ class TronClassClient:
             base_url=self.base_url,
             expires_at=expires_at,
         )
+
+    # ========== 会话凭证滚动续期（响应 Set-Cookie / x-session-id 消费） ==========
+
+    SESSION_WRITEBACK_MIN_INTERVAL = 60.0  # 持久化节流：两次写回最小间隔（秒）
+
+    def _apply_response_credentials(self, resp: aiohttp.ClientResponse) -> bool:
+        """消费一次响应中的会话续期凭证，同步到内存快照。
+
+        服务器（courses 域）在几乎每个响应中滚动重签 session/role_token cookie，
+        并回传同值的 x-session-id 响应头（见 示例数据包/[506] 等）。
+        本方法以“当前 CookieJar 中会随 base_url 发送的 cookie”为最新快照源，
+        以响应头 X-Session-ID 为 session_id 的权威源（header 优先于 cookie）。
+
+        Returns:
+            True 表示快照发生实质变化（调用方可据此决定是否持久化）。
+        """
+        if self._tron_session is None or self._session is None:
+            return False
+        session = self._tron_session
+        jar_cookies = filter_cookies_for_base(
+            self._session.cookie_jar, self.base_url
+        )
+        new_sid = resp.headers.get("X-Session-ID", "") or _cookie_value_ci(
+            jar_cookies, "session", session.session_id
+        )
+        new_role = _cookie_value_ci(jar_cookies, "role_token", session.role_token)
+
+        changed = (
+            jar_cookies != session.cookies
+            or new_sid != session.session_id
+            or new_role != session.role_token
+        )
+        if not changed:
+            return False
+
+        session.cookies = jar_cookies
+        if new_sid:
+            session.session_id = new_sid
+        if new_role:
+            session.role_token = new_role
+            session.expires_at = decode_jwt_expiry(new_role)
+        session.updated_at = time.time()
+        return True
+
+    async def _persist_if_due(self):
+        """将最新凭证写回存储（节流：SESSION_WRITEBACK_MIN_INTERVAL 内至多一次）。"""
+        if self._writeback is None or self._tron_session is None:
+            return
+        now = time.time()
+        if now - self._last_persist_at < self.SESSION_WRITEBACK_MIN_INTERVAL:
+            return
+        data = self.get_session_data()
+        if data is None:
+            return
+        try:
+            await self._writeback(data)
+            self._last_persist_at = now
+        except Exception as e:
+            # 写回失败不影响业务请求，下个续期响应会重试
+            logger.warning(f"会话凭证写回存储失败：{e}")
 
     # ========== API 请求 ==========
 
@@ -614,6 +703,15 @@ class TronClassClient:
                 raise SessionInvalidError(
                     "会话已失效，请重新登录（响应被重定向到登录页）"
                 )
+
+        # 消费服务端滚动续期凭证（Set-Cookie 新 session/role_token + x-session-id 头）。
+        # 已在上面排除“重定向到登录页”的失效路径，此处为正常/业务响应。
+        if self._tron_session is not None:
+            try:
+                if self._apply_response_credentials(resp):
+                    await self._persist_if_due()
+            except Exception as e:
+                logger.debug(f"会话续期凭证同步失败：{e}")
 
         return resp
 
