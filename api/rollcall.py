@@ -3,6 +3,7 @@
 from typing import List
 
 from .auth import TronClassClient
+from ..config import ROLLCALL_STATUS_ATTENDED
 
 
 async def fetch_rollcalls(client: TronClassClient) -> List[dict]:
@@ -12,7 +13,8 @@ async def fetch_rollcalls(client: TronClassClient) -> List[dict]:
         client: 已登录的 TronClassClient 实例。
 
     Returns:
-        点名列表，每项包含 id, course_title, status, rollcall_time 等。
+        点名列表，每项包含 id, course_title, status, rollcall_time 等；
+        已签到的点名（on_call_fine）已被剔除（P1-6，黑名单策略）。
     """
     raw = await client.get_rollcalls()
 
@@ -31,7 +33,9 @@ async def fetch_rollcalls(client: TronClassClient) -> List[dict]:
         }
         rollcalls.append(rc)
 
-    return rollcalls
+    # P1-6：剔除已签到的点名。过滤基于同一列表，被剔除的 ID 不进 seen 集合、
+    # 也不会被 detect_new_rollcalls 判为 new → 无重复推送风险。
+    return [rc for rc in rollcalls if rc.get("status") != ROLLCALL_STATUS_ATTENDED]
 
 
 def detect_new_rollcalls(

@@ -25,6 +25,7 @@ from ..config import (
     KV_ALL_LOGGED_IN_USERS,
     KV_PUSH_FAIL_PREFIX,
     KV_DUE_NOTIFIED_PREFIX,
+    KV_SCHEDULE_EXPIRED_PREFIX,
 )
 
 # Session 存储格式版本（v2 = Fernet 密文）
@@ -343,3 +344,52 @@ class StorageService:
     async def save_due_notified(self, user_id: str, data: dict) -> None:
         """保存快到期已通知记录。"""
         await self._plugin.put_kv_data(f"{KV_DUE_NOTIFIED_PREFIX}:{user_id}", data)
+
+    # ========== 数据清理（P1-1/P1-3） ==========
+    # 注：_push_fail 已有 clear_push_failure，_login_attempts 属防暴破记录，登出时一律不清。
+
+    async def delete_session_origin(self, user_id: str) -> None:
+        """删除用户推送目标记录。"""
+        await self._plugin.delete_kv_data(f"{KV_SESSION_ORIGIN_PREFIX}:{user_id}")
+
+    async def delete_homeworks(self, user_id: str) -> None:
+        """删除用户作业缓存。"""
+        await self._plugin.delete_kv_data(f"{KV_HOMEWORKS_PREFIX}:{user_id}")
+
+    async def delete_schedule(self, user_id: str) -> None:
+        """删除用户课表。"""
+        await self._plugin.delete_kv_data(f"{KV_SCHEDULE_PREFIX}:{user_id}")
+
+    async def delete_rollcall_seen_ids(self, user_id: str) -> None:
+        """删除用户点名去重 ID 集合。"""
+        await self._plugin.delete_kv_data(f"{KV_ROLLCALL_SEEN_PREFIX}:{user_id}")
+
+    async def delete_due_notified(self, user_id: str) -> None:
+        """删除用户快到期去重记录。"""
+        await self._plugin.delete_kv_data(f"{KV_DUE_NOTIFIED_PREFIX}:{user_id}")
+
+    async def delete_last_rollcall_time(self, user_id: str) -> None:
+        """删除用户上次点名检测的时间戳。"""
+        await self._plugin.delete_kv_data(f"{KV_LAST_ROLLCALL_CHECK_PREFIX}:{user_id}")
+
+    # ========== 课表过期提醒（P1-1） ==========
+
+    async def get_schedule_expired_notified(self, user_id: str) -> float:
+        """获取上次课表过期提醒的时间戳（无记录返回 0）。"""
+        ts = await self._plugin.get_kv_data(
+            f"{KV_SCHEDULE_EXPIRED_PREFIX}:{user_id}", default=0
+        )
+        return ts if isinstance(ts, (int, float)) else 0
+
+    async def mark_schedule_expired_notified(
+        self, user_id: str, ts: Optional[float] = None
+    ) -> None:
+        """记录课表过期提醒时间。
+
+        - 不传 ts：记录当前时间（本次已提醒，进入冷却期）
+        - 传 ts=0：复位（重新上传课表后可再次提醒）
+        """
+        await self._plugin.put_kv_data(
+            f"{KV_SCHEDULE_EXPIRED_PREFIX}:{user_id}",
+            time.time() if ts is None else ts,
+        )

@@ -6,12 +6,17 @@
 
 import asyncio
 import time
+from datetime import datetime
 from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context
 
-from ..api.auth import TronClassClient, check_session_valid
+from ..api.auth import (
+    TronClassClient,
+    check_session_valid,
+    SessionInvalidError,
+)
 from ..api.homework import (
     fetch_homeworks,
     diff_homeworks,
@@ -19,10 +24,17 @@ from ..api.homework import (
 )
 from ..api.rollcall import fetch_rollcalls, detect_new_rollcalls
 from .storage import StorageService
-from .ics_parser import is_in_class_now
+from .ics_parser import is_in_class_now, is_schedule_expired
 from .identity import build_friend_origin, resolve_platform_id
 from .notifier import format_multiple_homework_notifications, format_new_rollcall
-from ..config import PUSH_FAIL_THRESHOLD, PUSH_FAIL_NOTIFY_COOLDOWN
+from ..config import (
+    PUSH_FAIL_THRESHOLD,
+    PUSH_FAIL_NOTIFY_COOLDOWN,
+    SCHEDULE_EXPIRED_NOTIFY_COOLDOWN,
+    FETCH_FAIL_BACKOFF_BASE,
+    FETCH_FAIL_BACKOFF_MAX,
+    FETCH_FAIL_ALERT_THRESHOLD,
+)
 
 
 class SchedulerService:
@@ -45,6 +57,7 @@ class SchedulerService:
         enable_homework_notify: bool = True,
         enable_due_warning: bool = True,
         enable_rollcall_notify: bool = True,
+        quiet_hours: dict | None = None,
     ):
         self._context = context
         self._storage = storage
@@ -55,6 +68,11 @@ class SchedulerService:
         self._enable_homework_notify = enable_homework_notify
         self._enable_due_warning = enable_due_warning
         self._enable_rollcall_notify = enable_rollcall_notify
+        self._quiet_hours = quiet_hours or {}
+
+        # 拉取失败退避（P1-5）：{f"{user_id}:homework"/":rollcall": (连续失败数, 下次允许时间)}
+        # 内存态：退避是短时保护，插件重启后归零重新探测更健康（与 _session_check_cache 同风格）
+        self._fetch_failures: dict[str, tuple[int, float]] = {}
 
         # 作业检测 job ID
         self._homework_job_ids: list[str] = []
@@ -65,6 +83,75 @@ class SchedulerService:
 
     # verify_session 结果缓存 TTL（秒）
     SESSION_CHECK_TTL = 600
+
+    def _is_quiet_now(self, now: Optional[datetime] = None) -> bool:
+        """当前是否处于免打扰时段（P1-4）。
+
+        跨午夜判定（start > end 即跨午夜）；start == end 视为不启用。
+        **fail-open**：未配置 / 时间解析失败一律返回 False（非静默）——
+        宁可多推一条，不可漏推作业。本方法在 cron 入口调用、位于
+        gather/_run 的 try 之外，**绝不能抛异常**，否则整轮报错、通知永久失效。
+        """
+        qh = self._quiet_hours
+        if not qh or not qh.get("enabled"):
+            return False
+        try:
+            start = str(qh.get("start", "")).strip()
+            end = str(qh.get("end", "")).strip()
+            s_h, s_m = map(int, start.split(":"))
+            e_h, e_m = map(int, end.split(":"))
+        except Exception:
+            return False
+        if not (0 <= s_h <= 23 and 0 <= s_m <= 59 and 0 <= e_h <= 23 and 0 <= e_m <= 59):
+            return False  # 越界时间（如 25:00）视为坏输入 → 非静默
+        now = now or datetime.now()
+        now_min = now.hour * 60 + now.minute
+        s = s_h * 60 + s_m
+        e = e_h * 60 + e_m
+        if s == e:
+            return False
+        if s < e:
+            return s <= now_min < e
+        return now_min >= s or now_min < e
+
+    # ========== 拉取失败退避（P1-5） ==========
+
+    @staticmethod
+    def _fetch_key(user_id: str, kind: str) -> str:
+        return f"{user_id}:{kind}"
+
+    def _can_fetch(self, user_id: str, kind: str) -> bool:
+        """退避判定：距上次失败是否已过退避期（在 _run 内、免打扰之后调用）。"""
+        rec = self._fetch_failures.get(self._fetch_key(user_id, kind))
+        if not rec:
+            return True
+        failures, next_ts = rec
+        if time.time() >= next_ts:
+            return True
+        logger.debug(f"拉取退避中 [{user_id}/{kind}] 第 {failures} 次失败，跳过本轮")
+        return False
+
+    def _record_fetch_failure(self, user_id: str, kind: str) -> None:
+        """记录一次拉取失败：连续失败数 +1，指数退避计算下次允许时间。
+
+        必须在 _check_*_for_user 的**内层** except 中调用——内层已吞掉异常，
+        外层 _run 捕获不到，放外层等于从未触发。
+        """
+        key = self._fetch_key(user_id, kind)
+        failures = self._fetch_failures.get(key, (0, 0.0))[0] + 1
+        delay = min(
+            FETCH_FAIL_BACKOFF_BASE * (2 ** (failures - 1)),
+            FETCH_FAIL_BACKOFF_MAX,
+        )
+        self._fetch_failures[key] = (failures, time.time() + delay)
+        if failures >= FETCH_FAIL_ALERT_THRESHOLD:
+            logger.error(
+                f"拉取持续失败 [{user_id}/{kind}]：连续 {failures} 次，退避 {delay}s"
+            )
+
+    def _clear_fetch_failure(self, user_id: str, kind: str) -> None:
+        """拉取成功后归零退避计数。"""
+        self._fetch_failures.pop(self._fetch_key(user_id, kind), None)
 
     async def setup(self):
         """首次启动时注册所有定时任务。"""
@@ -134,6 +221,9 @@ class SchedulerService:
             logger.info(f"Session 已过期 [{user_id}]，清理并通知用户")
             await self._storage.delete_session(user_id)
             await self._storage.unregister_user(user_id)  # 保持注册表与真实 session 一致
+            # P1-5：用户 session 失效 → 清理其退避计数（防内存泄漏）
+            self._fetch_failures.pop(f"{user_id}:homework", None)
+            self._fetch_failures.pop(f"{user_id}:rollcall", None)
             await client.close()
             # 通知用户重新登录
             try:
@@ -170,6 +260,9 @@ class SchedulerService:
             event: AstrBot Cron 任务触发时传入的 CronMessageEvent（可选）。
             payload: Cron 任务的自定义 payload（可选）。
         """
+        if self._is_quiet_now():
+            return  # P1-4 免打扰：整轮跳过（不发请求不推送），diff/seen 在结束后自动补漏
+
         if not self._enable_homework_notify and not self._enable_due_warning:
             return
 
@@ -184,6 +277,8 @@ class SchedulerService:
 
         async def _run(uid: str):
             async with sem:
+                if not self._can_fetch(uid, "homework"):
+                    return  # P1-5 退避中
                 try:
                     await self._check_homeworks_for_user(uid)
                 except Exception as e:
@@ -198,6 +293,7 @@ class SchedulerService:
             return
         try:
             fresh = await fetch_homeworks(client)
+            self._clear_fetch_failure(user_id, "homework")
 
             cached = await self._storage.get_homeworks(user_id)
             diff = diff_homeworks(cached, fresh)
@@ -226,8 +322,13 @@ class SchedulerService:
                     await self._send_private_notification(user_id, msg)
                 except Exception as e:
                     logger.error(f"推送作业通知失败 [{user_id}]：{e}")
+        except SessionInvalidError as e:
+            # P1-5：session 失效不计退避——用户需要的是重新登录，退避只会延迟发现
+            self._clear_fetch_failure(user_id, "homework")
+            logger.info(f"作业检测 session 失效 [{user_id}]：{e}")
         except Exception as e:
             logger.warning(f"获取作业列表失败 [{user_id}]：{e}")
+            self._record_fetch_failure(user_id, "homework")
         finally:
             await client.close()
 
@@ -244,6 +345,9 @@ class SchedulerService:
             event: AstrBot Cron 任务触发时传入的 CronMessageEvent（可选）。
             payload: Cron 任务的自定义 payload（可选）。
         """
+        if self._is_quiet_now():
+            return  # P1-4 免打扰：整轮跳过（不发请求不推送），seen 在结束后自动补漏
+
         if not self._enable_rollcall_notify:
             return
 
@@ -256,6 +360,8 @@ class SchedulerService:
 
         async def _run(uid: str):
             async with sem:
+                if not self._can_fetch(uid, "rollcall"):
+                    return  # P1-5 退避中
                 try:
                     await self._check_rollcalls_for_user(uid)
                 except Exception as e:
@@ -264,15 +370,28 @@ class SchedulerService:
         await asyncio.gather(*(_run(uid) for uid in user_ids), return_exceptions=True)
 
     async def _check_rollcalls_for_user(self, user_id: str):
-        """为单个用户检测点名更新（client 生命周期由 finally 统一收口）。"""
-        schedule = await self._storage.get_schedule(user_id)
+        """为单个用户检测点名更新（client 生命周期由 finally 统一收口）。
 
+        P1-1 分支语义：课表有效且在上课 → ICS 驱动；课表过期/损坏/无课表 →
+        统一回退默认间隔轮询（否则学期结束后 is_in_class_now 恒 False，
+        点名检测会永久停摆且不回退、无提示）。
+        """
+        schedule = await self._storage.get_schedule(user_id)
+        if not isinstance(schedule, dict) or not schedule.get("courses"):
+            schedule = None  # 脏数据守卫：按无课表处理（镜像 main.py /我的状态 写法）
+
+        use_ics = False
         if schedule:
-            # ICS 驱动
-            if not is_in_class_now(schedule, self._precheck_minutes):
-                return  # 不在上课时间，跳过
-        else:
-            # 无课表 → 检查默认间隔
+            if is_schedule_expired(schedule):
+                # 课表已过期：提醒 + 回退默认轮询
+                await self._notify_schedule_expired(user_id)
+            elif not is_in_class_now(schedule, self._precheck_minutes):
+                return  # 正常的不在上课时间
+            else:
+                use_ics = True
+
+        if not use_ics:
+            # 课表过期 / 损坏 / 无课表 → 检查默认间隔
             if not await self._should_check_rollcall_by_default(user_id):
                 return
 
@@ -281,6 +400,7 @@ class SchedulerService:
             return
         try:
             current = await fetch_rollcalls(client)
+            self._clear_fetch_failure(user_id, "rollcall")
             if not current:
                 return
 
@@ -299,8 +419,13 @@ class SchedulerService:
                     await self._send_private_notification(user_id, msg)
                 except Exception as e:
                     logger.error(f"推送点名通知失败 [{user_id}]：{e}")
+        except SessionInvalidError as e:
+            # P1-5：session 失效不计退避——用户需要的是重新登录，退避只会延迟发现
+            self._clear_fetch_failure(user_id, "rollcall")
+            logger.info(f"点名检测 session 失效 [{user_id}]：{e}")
         except Exception as e:
             logger.warning(f"获取点名列表失败 [{user_id}]：{e}")
+            self._record_fetch_failure(user_id, "rollcall")
         finally:
             await client.close()
 
@@ -315,6 +440,21 @@ class SchedulerService:
             return True
 
         return False
+
+    async def _notify_schedule_expired(self, user_id: str):
+        """课表过期提醒（P1-1，24h 冷却，避免每分钟轮询都推）。"""
+        last = await self._storage.get_schedule_expired_notified(user_id)
+        if time.time() - last < SCHEDULE_EXPIRED_NOTIFY_COOLDOWN:
+            return
+        await self._storage.mark_schedule_expired_notified(user_id)
+        try:
+            await self._send_private_notification(
+                user_id,
+                "📅 你的课表已过期（本学期课程已结束），点名检测已回退为定时轮询。\n"
+                "请重新发送 /上传课表，或发送 /删除课表 停止提醒。",
+            )
+        except Exception as e:
+            logger.error(f"课表过期提醒发送失败 [{user_id}]：{e}")
 
     # ========== 通知发送 ==========
 

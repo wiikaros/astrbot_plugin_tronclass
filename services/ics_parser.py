@@ -244,3 +244,61 @@ def is_in_class_now(
             return True
 
     return False
+
+
+def _calc_current_week(schedule: dict, now: Optional[datetime] = None) -> Optional[int]:
+    """计算当前教学周（从学期起点）。
+
+    Args:
+        schedule: parse_ics() 返回的课表数据。
+        now: 要检查的时间点（默认为现在，用于测试）。
+
+    Returns:
+        当前教学周；semester_start 缺失/解析失败返回 None。
+    """
+    if not isinstance(schedule, dict):
+        return None
+    try:
+        semester_start = datetime.strptime(
+            schedule["semester_start"], "%Y-%m-%d"
+        ).date()
+    except (ValueError, KeyError, TypeError):
+        return None
+    if now is None:
+        now = datetime.now()
+    return (now.date() - semester_start).days // 7 + 1
+
+
+def is_schedule_expired(schedule: dict, now: Optional[datetime] = None) -> bool:
+    """判断课表是否已过期（当前教学周超出全部课程的周次覆盖范围）。
+
+    判定用 max(weeks_all)，不用硬编码 52（不同学校学期长度不同，52 会让
+    "第 17~52 周"这段区间静默失效却不触发过期逻辑）。
+
+    失败方向约定（P1-1，双防线之一）：
+    - semester_start 解析失败 → 返回 True（此时 is_in_class_now 必然为 False，
+      走 ICS 等于停摆，回退轮询是安全方向）；
+    - weeks 缺失/为空 → 返回 False（与 is_in_class_now 的"空 weeks = 每周都有课"
+      语义一致，视为不过期）；
+    - 任何意外异常 → 返回 True（回退轮询）。否则异常会冒泡到 scheduler 的
+      `_run` try/except 被静默吞掉，把"永久停摆"换成"静默跳过"。
+    """
+    if not isinstance(schedule, dict):
+        return False
+    try:
+        courses = schedule.get("courses") or []
+        if not courses:
+            return False
+        weeks_all = set()
+        for course in courses:
+            for w in (course.get("weeks") or []):
+                if isinstance(w, int) and not isinstance(w, bool):
+                    weeks_all.add(w)
+        if not weeks_all:
+            return False
+        current_week = _calc_current_week(schedule, now)
+        if current_week is None:
+            return True
+        return current_week > max(weeks_all)
+    except Exception:
+        return True

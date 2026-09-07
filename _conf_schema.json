@@ -37,5 +37,22 @@
         "description": "新点名时推送通知",
         "type": "bool",
         "default": true
+    },
+    "quiet_hours_enabled": {
+        "description": "启用免打扰时段（时段内暂停定时推送与检测）",
+        "type": "bool",
+        "default": true
+    },
+    "quiet_hours_start": {
+        "description": "免打扰开始时间",
+        "hint": "HH:MM 格式；跨午夜时早于结束时间，如 23:00 → 07:00",
+        "type": "string",
+        "default": "23:00"
+    },
+    "quiet_hours_end": {
+        "description": "免打扰结束时间",
+        "hint": "HH:MM 格式；与开始时间相同视为不启用",
+        "type": "string",
+        "default": "07:00"
     }
 }

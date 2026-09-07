@@ -16,12 +16,20 @@ from .config import (
     DEFAULT_ROLLCALL_DEFAULT_INTERVAL,
     DEFAULT_ROLLCALL_PRECHECK_MINUTES,
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
+    DEFAULT_QUIET_HOURS_ENABLED,
+    DEFAULT_QUIET_HOURS_START,
+    DEFAULT_QUIET_HOURS_END,
 )
 from .api.auth import TronClassClient, SessionInvalidError
 from .api._utils import download_file_http
 from .api.homework import fetch_homeworks, diff_homeworks, get_imminent_due
 from .services.storage import StorageService
-from .services.ics_parser import parse_ics, is_in_class_now
+from .services.ics_parser import (
+    parse_ics,
+    is_in_class_now,
+    is_schedule_expired,
+    _calc_current_week,
+)
 from .services.identity import get_user_key, build_friend_origin, resolve_platform_id
 from .services.notifier import format_homework_summary, _fmt_due
 from .services.scheduler import SchedulerService
@@ -118,6 +126,17 @@ class TronClassPlugin(Star):
                 enable_rollcall_notify=self._get_config(
                     "enable_rollcall_notify", True
                 ),
+                quiet_hours={
+                    "enabled": self._get_config(
+                        "quiet_hours_enabled", DEFAULT_QUIET_HOURS_ENABLED
+                    ),
+                    "start": self._get_config(
+                        "quiet_hours_start", DEFAULT_QUIET_HOURS_START
+                    ),
+                    "end": self._get_config(
+                        "quiet_hours_end", DEFAULT_QUIET_HOURS_END
+                    ),
+                },
             )
             await self._scheduler.setup()
             logger.info("畅课助手：定时任务初始化完成")
@@ -374,6 +393,27 @@ class TronClassPlugin(Star):
         finally:
             event.stop_event()
 
+    # ========== 命令：/删除课表 ==========
+
+    @filter.command("删除课表")
+    async def cmd_delete_schedule(self, event: AstrMessageEvent):
+        """删除已上传的课表，点名检测恢复为默认间隔轮询（P1-1）。
+
+        同时复位"课表过期"提醒标记，保证之后重新上传课表仍能收到过期提示。
+        """
+        user_id = self._get_user_id(event)
+        schedule = await self._storage.get_schedule(user_id)
+        if not schedule:
+            yield event.plain_result("📅 你还没有上传课表。")
+            return
+
+        await self._storage.delete_schedule(user_id)
+        await self._storage.mark_schedule_expired_notified(user_id, ts=0.0)
+        yield event.plain_result(
+            "✅ 课表已删除，点名检测将按默认间隔轮询。\n"
+            "需要时重新发送 /上传课表。"
+        )
+
     # ========== 命令：/我的状态 ==========
 
     @filter.command("我的状态")
@@ -425,10 +465,30 @@ class TronClassPlugin(Star):
         if schedule and schedule.get("courses"):
             courses = schedule.get("courses", [])
             in_class = is_in_class_now(schedule, 0)
-            lines.append(
-                f"📅 课表：✅ {len(courses)} 门（学期起始 "
-                f"{schedule.get('semester_start', '未知')}，当前{'上课中' if in_class else '未在上课'}）"
-            )
+            # P1-1：展示周次与过期状态，让用户能自查"点名检测为何回退轮询"
+            current_week = _calc_current_week(schedule)
+            weeks_all = {
+                w for c in courses for w in (c.get("weeks") or [])
+                if isinstance(w, int) and not isinstance(w, bool)
+            }
+            if is_schedule_expired(schedule):
+                max_week = max(weeks_all) if weeks_all else "?"
+                cur = current_week if current_week else "?"
+                lines.append(
+                    f"📅 课表：⚠️ 已过期（覆盖至第 {max_week} 周，当前第 {cur} 周）"
+                )
+                lines.append("   点名检测已回退为轮询，请重新 /上传课表 或 /删除课表")
+            else:
+                week_part = (
+                    f"，第 {current_week}/{max(weeks_all)} 周"
+                    if current_week and weeks_all
+                    else ""
+                )
+                lines.append(
+                    f"📅 课表：✅ {len(courses)} 门（学期起始 "
+                    f"{schedule.get('semester_start', '未知')}"
+                    f"{week_part}，当前{'上课中' if in_class else '未在上课'}）"
+                )
         else:
             lines.append("📅 课表：❌ 未上传（点名检测将按默认间隔轮询）")
 
@@ -482,6 +542,71 @@ class TronClassPlugin(Star):
             )
 
         yield event.plain_result("\n".join(lines))
+
+    # ========== 命令：/登出 ==========
+
+    @filter.command("登出")
+    async def cmd_logout(self, event: AstrMessageEvent):
+        """自助登出：二次确认后清除全部个人数据（P1-3）。
+
+        清除：session / 推送目标 / 作业缓存 / 课表 / 点名去重 / 快到期去重 /
+        推送失败计数 / 点名时间戳，并从已登录注册表移除。
+        **保留 _login_attempts**：登录频率限制是防暴破记录，清除它等于给
+        攻击者重置重试机会。
+
+        已知行为：若此前发起的 /微信登录 轮询任务仍在（最长 180 秒），期间
+        扫码会重新写入 session（覆盖本次登出）——扫码即代表想登录，属预期，不做取消。
+        """
+        user_id = self._get_user_id(event)
+
+        if not await self._storage.get_session(user_id):
+            yield event.plain_result("🔐 你尚未登录，无需登出。")
+            return
+
+        yield event.plain_result(
+            "⚠️ 确认登出？将清除你的登录凭据、作业缓存与课表。\n"
+            "发送「确认」执行，发送「退出」取消。"
+        )
+
+        @session_waiter(timeout=120, record_history_chains=False)
+        async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            text = (evt.message_str or "").strip()
+            if text == "退出":
+                await evt.send(evt.plain_result("已取消登出。"))
+                controller.stop()
+                return
+            if text != "确认":
+                await evt.send(
+                    evt.plain_result("请发送「确认」执行登出，或发送「退出」取消。")
+                )
+                controller.keep(timeout=120, reset_timeout=True)
+                return
+
+            # 清理进行中的登录残留状态（幂等；密码登录进行中时 waiter 会拦截本命令，到不了这里）
+            await self._login_flow.cleanup_login(user_id)
+            await self._storage.delete_session(user_id)
+            await self._storage.delete_session_origin(user_id)
+            await self._storage.delete_homeworks(user_id)
+            await self._storage.delete_schedule(user_id)
+            await self._storage.delete_rollcall_seen_ids(user_id)
+            await self._storage.delete_due_notified(user_id)
+            await self._storage.delete_last_rollcall_time(user_id)
+            await self._storage.clear_push_failure(user_id)
+            # 注册表最后移除：保证定时任务不再遍历该用户（与现有 delete+unregister 范式一致）
+            await self._storage.unregister_user(user_id)
+
+            await evt.send(evt.plain_result(
+                "✅ 已登出，全部个人数据已清除。\n"
+                "需要时重新发送 /登录畅课 或 /微信登录。"
+            ))
+            controller.stop()
+
+        try:
+            await waiter(event)
+        except TimeoutError:
+            yield event.plain_result("⏰ 操作超时，已取消登出。")
+        finally:
+            event.stop_event()
 
     @staticmethod
     async def _try_get_file_url(evt: AstrMessageEvent) -> str | None:
