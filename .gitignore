@@ -30,10 +30,12 @@ data/
 示例数据包/
 CLAUDE.md
 .workbuddy/
+docs/
 
 # Sensitive debug artifacts (never commit real credentials)
+debug/
 debug/session.json
 debug/*.html
 
 # Build artifacts
-main.zip
+*.zip
