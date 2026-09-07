@@ -98,11 +98,22 @@ class TronClassPlugin(Star):
 
     # ========== 事件：插件加载完成 ==========
 
-    @filter.on_astrbot_loaded()
-    async def on_bot_loaded(self, event: AstrMessageEvent):
-        """插件加载完成后初始化定时任务。"""
-        logger.info("畅课助手：初始化定时任务...")
+    async def _init_scheduler(self) -> bool:
+        """创建并启动定时任务（幂等，可被多个生命周期入口调用）。
 
+        挂载点：
+        - on_astrbot_loaded：AstrBot 冷启动完成；
+        - on_plugin_loaded：插件每次加载 / 热重载都会触发 —— 使定时任务
+          不依赖整服务重启即可重建（修复热重载后 scheduler 为 None 的问题）。
+
+        cron_manager 未就绪时返回 False，由后续入口自动重试。
+        """
+        if self._scheduler is not None:
+            return True
+        cron = getattr(self.context, "cron_manager", None)
+        if cron is None:
+            logger.warning("cron_manager 未就绪，定时任务初始化延后（下次插件加载将重试）")
+            return False
         try:
             self._scheduler = SchedulerService(
                 context=self.context,
@@ -140,10 +151,27 @@ class TronClassPlugin(Star):
             )
             await self._scheduler.setup()
             logger.info("畅课助手：定时任务初始化完成")
+            return True
         except Exception as e:
             # 定时任务注册失败不阻塞插件加载，仅降级（无自动通知）
             logger.error(f"定时任务初始化失败，自动通知功能将不可用：{e}")
             self._scheduler = None
+            return False
+
+    @filter.on_plugin_loaded()
+    async def on_plugin_loaded(self, metadata=None):
+        """插件每次（重）加载都会触发：确保定时任务已就绪。
+
+        on_astrbot_loaded 只在 AstrBot 冷启动时执行一次；插件热重载（更新代码、
+        在后台重载插件）不会重跑它。这里在每次插件加载时幂等地补齐 scheduler，
+        使定时任务不依赖整服务重启即可正常工作。
+        """
+        await self._init_scheduler()
+
+    @filter.on_astrbot_loaded()
+    async def on_bot_loaded(self, event: AstrMessageEvent):
+        """AstrBot 冷启动完成：初始化定时任务 + 存量迁移 + 启动清扫。"""
+        await self._init_scheduler()
 
         # P0-3/P0-4：存量 KV 迁移（幂等，单平台场景；失败不影响加载，下次启动自愈）
         try:
