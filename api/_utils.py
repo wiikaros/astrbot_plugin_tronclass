@@ -13,23 +13,37 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def decode_jwt_expiry(jwt_token: str) -> float:
-    """从 JWT token 解码 exp 字段，返回过期时间戳。
+    """从 role_token 解码 exp 字段，返回过期时间戳。
+
+    兼容两种格式：
+    - 标准三段 JWT（header.payload.signature）→ 取第 2 段 payload；
+    - TronClass 两段紧凑格式 `<payload>.<签名>`（无 header，签名段为 27 字节
+      二进制，见 示例数据包 role_token）→ 取第 1 段 payload。
+
+    解析失败返回 0.0（语义=过期时间未知）。调用方应把 0 视为“不确定”，
+    依赖真实请求（302→登录页）判定，而不要回退成“当前+1h”这种会定时误杀的值。
 
     Args:
-        jwt_token: JWT 字符串（如 role_token）。
+        jwt_token: role_token / JWT 字符串。
 
     Returns:
-        exp 时间戳（秒），解码失败时返回 time.time() + 3600（默认 1 小时）。
+        exp 时间戳（秒），成功时；解析失败返回 0.0。
     """
     try:
-        payload = jwt_token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(payload))
-        if "exp" in decoded:
+        parts = jwt_token.split(".")
+        if len(parts) >= 3:
+            payload_b64 = parts[1]
+        elif len(parts) == 2:
+            payload_b64 = parts[0]
+        else:
+            return 0.0
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload_b64))
+        if isinstance(decoded.get("exp"), (int, float)):
             return float(decoded["exp"])
     except Exception:
         pass
-    return time.time() + 3600
+    return 0.0
 
 
 DATETIME_FORMATS = (
