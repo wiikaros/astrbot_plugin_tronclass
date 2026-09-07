@@ -29,9 +29,10 @@ LOGIN_STATE_TTL_SECONDS = 300          # 登录状态超时（5 分钟）
 MAX_LOGIN_ATTEMPTS_PER_HOUR = 3        # 每小时最大登录尝试次数
 SSO_HOST = "https://sso.cuc.edu.cn"    # CAS 单点登录服务器（兜底默认，运行时从 cas_url 解析优先）
 
+# ========== 固定值（插件仅接入中国传媒大学畅课） ==========
+BASE_URL = "https://courses.cuc.edu.cn"
+
 # ========== 默认值 ==========
-DEFAULT_BASE_URL = "https://courses.cuc.edu.cn"
-DEFAULT_SCHOOL_NAME = "中国传媒大学"
 DEFAULT_HOMEWORK_CHECK_INTERVAL = 30   # 分钟
 DEFAULT_ROLLCALL_DEFAULT_INTERVAL = 5  # 分钟
 DEFAULT_ROLLCALL_PRECHECK_MINUTES = 5  # 分钟

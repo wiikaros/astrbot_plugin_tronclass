@@ -1,21 +1,4 @@
 {
-    "school": {
-        "description": "畅课服务器配置",
-        "type": "object",
-        "items": {
-            "base_url": {
-                "description": "畅课服务器地址",
-                "hint": "支持自定义域名，默认使用中国传媒大学畅课",
-                "type": "string",
-                "default": "https://courses.cuc.edu.cn"
-            },
-            "name": {
-                "description": "学校名称（仅用于展示）",
-                "type": "string",
-                "default": "中国传媒大学"
-            }
-        }
-    },
     "homework_check_interval": {
         "description": "作业定时检测间隔（分钟）",
         "hint": "范围建议 10-120 分钟",

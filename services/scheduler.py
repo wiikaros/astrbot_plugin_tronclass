@@ -38,7 +38,6 @@ class SchedulerService:
         self,
         context: Context,
         storage: StorageService,
-        base_url: str,
         homework_interval: int = 30,
         rollcall_default_interval: int = 5,
         precheck_minutes: int = 5,
@@ -49,7 +48,6 @@ class SchedulerService:
     ):
         self._context = context
         self._storage = storage
-        self._base_url = base_url
         self._homework_interval = homework_interval
         self._rollcall_default_interval = rollcall_default_interval
         self._precheck_minutes = precheck_minutes

@@ -12,7 +12,6 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from .config import (
     PLUGIN_NAME,
     KV_LOGIN_ATTEMPTS_PREFIX,
-    DEFAULT_BASE_URL,
     DEFAULT_HOMEWORK_CHECK_INTERVAL,
     DEFAULT_ROLLCALL_DEFAULT_INTERVAL,
     DEFAULT_ROLLCALL_PRECHECK_MINUTES,
@@ -56,18 +55,9 @@ class TronClassPlugin(Star):
     # ========== 辅助方法 ==========
 
     def _get_config(self, key: str, default=None):
-        """安全读取配置项，支持嵌套 key（如 'school.base_url'）。"""
+        """安全读取配置项。"""
         if self.config is None:
             return default
-        if "." in key:
-            parts = key.split(".")
-            value = self.config
-            for part in parts:
-                if isinstance(value, dict):
-                    value = value.get(part)
-                else:
-                    return default
-            return value if value is not None else default
         return self.config.get(key, default)
 
     def _get_user_id(self, event: AstrMessageEvent) -> str:
@@ -81,10 +71,6 @@ class TronClassPlugin(Star):
             return gid is None or gid == ""
         except Exception:
             return True
-
-    def _get_base_url(self) -> str:
-        """获取配置的畅课服务器地址。"""
-        return self._get_config("school.base_url", DEFAULT_BASE_URL)
 
     async def _create_client(self, user_id: str) -> TronClassClient | None:
         """为用户创建已认证的 API 客户端。"""
@@ -113,7 +99,6 @@ class TronClassPlugin(Star):
             self._scheduler = SchedulerService(
                 context=self.context,
                 storage=self._storage,
-                base_url=self._get_base_url(),
                 homework_interval=self._get_config(
                     "homework_check_interval", DEFAULT_HOMEWORK_CHECK_INTERVAL
                 ),

@@ -31,6 +31,7 @@ from ..api.wechat_login import WeChatLoginFlow
 from ..services.identity import build_friend_origin, get_user_key
 from ..config import (
     PLUGIN_NAME,
+    BASE_URL,
     LOGIN_STATE_TTL_SECONDS,
     MAX_LOGIN_ATTEMPTS_PER_HOUR,
     KV_LOGIN_ATTEMPTS_PREFIX,
@@ -205,7 +206,7 @@ class LoginFlowManager:
                         return
                     client = self._login_clients.get(uid)
                     if client is None:
-                        client = TronClassClient(plugin._get_base_url())
+                        client = TronClassClient(BASE_URL)
                         self._login_clients[uid] = client
                     lock = self._login_locks.setdefault(uid, asyncio.Lock())
                     try:
@@ -409,8 +410,7 @@ class LoginFlowManager:
             old_task.cancel()
         self._wechat_tasks.pop(user_id, None)
 
-        base_url = plugin._get_base_url()
-        flow = WeChatLoginFlow(base_url)
+        flow = WeChatLoginFlow(BASE_URL)
 
         # Step 1: 初始化 CAS session
         yield event.plain_result("🔐 正在准备微信登录，请稍候...")
