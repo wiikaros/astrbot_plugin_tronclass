@@ -98,15 +98,6 @@
 - **登录频率限制**：每用户每小时最多尝试 3 次登录，超限需管理员 `/重置登录限制` 或等待 1 小时
 - **凭据安全**：登录凭据经加密后存储，密码与短信验证码不落盘、不入日志
 
-## 🧑‍💻 开发
-
-```bash
-pip install pytest
-python -m pytest tests/ -v   # 87 个用例
-```
-
-代码分层清晰（`api/` 协议封装、`services/` 业务逻辑、`main.py` 入口编排），欢迎提交 PR。
-
 ## License
 
 AGPL-3.0 © wiikaros
