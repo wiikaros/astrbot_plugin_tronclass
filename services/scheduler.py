@@ -58,6 +58,9 @@ class SchedulerService:
         enable_due_warning: bool = True,
         enable_rollcall_notify: bool = True,
         quiet_hours: dict | None = None,
+        enable_homework_check: bool = True,
+        enable_rollcall_check: bool = True,
+        rollcall_in_class_interval: int = 1,
     ):
         self._context = context
         self._storage = storage
@@ -69,6 +72,11 @@ class SchedulerService:
         self._enable_due_warning = enable_due_warning
         self._enable_rollcall_notify = enable_rollcall_notify
         self._quiet_hours = quiet_hours or {}
+        # v1.1 功能总开关：关闭后 setup() 不注册对应 cron job（零空转）
+        self._enable_homework_check = enable_homework_check
+        self._enable_rollcall_check = enable_rollcall_check
+        # v1.1 课内点名间隔：有课表且上课时间内按此间隔节流（默认 1 分钟 = 与 v1.0 每分钟一致）
+        self._rollcall_in_class_interval = rollcall_in_class_interval
 
         # 拉取失败退避（P1-5）：{f"{user_id}:homework"/":rollcall": (连续失败数, 下次允许时间)}
         # 内存态：退避是短时保护，插件重启后归零重新探测更健康（与 _session_check_cache 同风格）
@@ -154,13 +162,24 @@ class SchedulerService:
         self._fetch_failures.pop(self._fetch_key(user_id, kind), None)
 
     async def setup(self):
-        """首次启动时注册所有定时任务。"""
-        await self._schedule_homework_check()
-        await self._schedule_rollcall_check()
-        logger.info(
-            f"定时任务已注册：作业检测每 {self._homework_interval} 分钟，"
-            f"点名检测每 {self._rollcall_default_interval} 分钟"
-        )
+        """首次启动时注册所有定时任务（v1.1：按功能总开关条件注册）。"""
+        if self._enable_homework_check:
+            await self._schedule_homework_check()
+        else:
+            logger.info("作业自动检测已禁用（总开关关闭），未注册定时任务")
+        if self._enable_rollcall_check:
+            await self._schedule_rollcall_check()
+        else:
+            logger.info("点名自动检测已禁用（总开关关闭），未注册定时任务")
+        registered = []
+        if self._enable_homework_check:
+            registered.append(f"作业检测每 {self._homework_interval} 分钟")
+        if self._enable_rollcall_check:
+            registered.append(f"点名检测每 {self._rollcall_default_interval} 分钟")
+        if registered:
+            logger.info("定时任务已注册：" + "，".join(registered))
+        else:
+            logger.info("定时任务已注册：无（作业/点名检测均已禁用）")
 
     async def shutdown(self):
         """插件卸载/重载时注销全部定时任务。
@@ -260,6 +279,9 @@ class SchedulerService:
             event: AstrBot Cron 任务触发时传入的 CronMessageEvent（可选）。
             payload: Cron 任务的自定义 payload（可选）。
         """
+        if not self._enable_homework_check:
+            return  # v1.1 总开关防御（未注册 job 的双保险）
+
         if self._is_quiet_now():
             return  # P1-4 免打扰：整轮跳过（不发请求不推送），diff/seen 在结束后自动补漏
 
@@ -345,6 +367,9 @@ class SchedulerService:
             event: AstrBot Cron 任务触发时传入的 CronMessageEvent（可选）。
             payload: Cron 任务的自定义 payload（可选）。
         """
+        if not self._enable_rollcall_check:
+            return  # v1.1 总开关防御（未注册 job 的双保险）
+
         if self._is_quiet_now():
             return  # P1-4 免打扰：整轮跳过（不发请求不推送），seen 在结束后自动补漏
 
@@ -390,7 +415,13 @@ class SchedulerService:
             else:
                 use_ics = True
 
-        if not use_ics:
+        if use_ics:
+            # 上课时间内：按课内间隔节流（v1.1，默认 1 分钟 = 与 v1.0 每分钟一致）
+            if not await self._should_check_rollcall_by_default(
+                user_id, self._rollcall_in_class_interval
+            ):
+                return
+        else:
             # 课表过期 / 损坏 / 无课表 → 检查默认间隔
             if not await self._should_check_rollcall_by_default(user_id):
                 return
@@ -429,10 +460,20 @@ class SchedulerService:
         finally:
             await client.close()
 
-    async def _should_check_rollcall_by_default(self, user_id: str) -> bool:
-        """检查是否到达无课表时的默认点名检测间隔。"""
+    async def _should_check_rollcall_by_default(
+        self, user_id: str, interval_minutes: Optional[int] = None
+    ) -> bool:
+        """检查是否到达点名检测间隔（课内/无课表共用同一时间戳节流）。
+
+        interval_minutes 为 None 时回退无课表默认间隔（行为与 v1.0 一致）。
+        """
         now = int(time.time())
-        interval_seconds = self._rollcall_default_interval * 60
+        minutes = (
+            interval_minutes
+            if interval_minutes is not None
+            else self._rollcall_default_interval
+        )
+        interval_seconds = minutes * 60
         last_check = await self._storage.get_last_rollcall_time(user_id)
 
         if now - last_check >= interval_seconds:

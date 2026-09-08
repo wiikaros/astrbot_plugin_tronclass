@@ -14,6 +14,7 @@ from .config import (
     KV_LOGIN_ATTEMPTS_PREFIX,
     DEFAULT_HOMEWORK_CHECK_INTERVAL,
     DEFAULT_ROLLCALL_DEFAULT_INTERVAL,
+    DEFAULT_ROLLCALL_IN_CLASS_INTERVAL,
     DEFAULT_ROLLCALL_PRECHECK_MINUTES,
     DEFAULT_HOMEWORK_DUE_WARN_HOURS,
     DEFAULT_QUIET_HOURS_ENABLED,
@@ -115,39 +116,40 @@ class TronClassPlugin(Star):
             logger.warning("cron_manager 未就绪，定时任务初始化延后（下次插件加载将重试）")
             return False
         try:
+            # v1.1 配置分组嵌套：homework_check / rollcall_check / quiet_hours
+            hw_cfg = self._get_config("homework_check", {}) or {}
+            rc_cfg = self._get_config("rollcall_check", {}) or {}
+            qh_cfg = self._get_config("quiet_hours", {}) or {}
             self._scheduler = SchedulerService(
                 context=self.context,
                 storage=self._storage,
-                homework_interval=self._get_config(
+                homework_interval=hw_cfg.get(
                     "homework_check_interval", DEFAULT_HOMEWORK_CHECK_INTERVAL
                 ),
-                rollcall_default_interval=self._get_config(
+                rollcall_default_interval=rc_cfg.get(
                     "rollcall_default_interval", DEFAULT_ROLLCALL_DEFAULT_INTERVAL
                 ),
-                precheck_minutes=self._get_config(
+                precheck_minutes=rc_cfg.get(
                     "rollcall_class_precheck_minutes", DEFAULT_ROLLCALL_PRECHECK_MINUTES
                 ),
-                due_warn_hours=self._get_config(
+                due_warn_hours=hw_cfg.get(
                     "homework_due_warn_hours", DEFAULT_HOMEWORK_DUE_WARN_HOURS
                 ),
-                enable_homework_notify=self._get_config(
-                    "enable_new_homework_notify", True
-                ),
-                enable_due_warning=self._get_config("enable_due_warning", True),
-                enable_rollcall_notify=self._get_config(
-                    "enable_rollcall_notify", True
-                ),
+                enable_homework_notify=hw_cfg.get("enable_new_homework_notify", True),
+                enable_due_warning=hw_cfg.get("enable_due_warning", True),
+                enable_rollcall_notify=rc_cfg.get("enable_rollcall_notify", True),
                 quiet_hours={
-                    "enabled": self._get_config(
+                    "enabled": qh_cfg.get(
                         "quiet_hours_enabled", DEFAULT_QUIET_HOURS_ENABLED
                     ),
-                    "start": self._get_config(
-                        "quiet_hours_start", DEFAULT_QUIET_HOURS_START
-                    ),
-                    "end": self._get_config(
-                        "quiet_hours_end", DEFAULT_QUIET_HOURS_END
-                    ),
+                    "start": qh_cfg.get("quiet_hours_start", DEFAULT_QUIET_HOURS_START),
+                    "end": qh_cfg.get("quiet_hours_end", DEFAULT_QUIET_HOURS_END),
                 },
+                enable_homework_check=hw_cfg.get("enable_homework_check", True),
+                enable_rollcall_check=rc_cfg.get("enable_rollcall_check", True),
+                rollcall_in_class_interval=rc_cfg.get(
+                    "rollcall_in_class_interval", DEFAULT_ROLLCALL_IN_CLASS_INTERVAL
+                ),
             )
             await self._scheduler.setup()
             logger.info("畅课助手：定时任务初始化完成")
@@ -324,8 +326,9 @@ class TronClassPlugin(Star):
         # 保存最新数据
         await self._storage.save_homeworks(user_id, fresh)
 
-        # 检查快到期
-        warn_hours = self._get_config(
+        # 检查快到期（v1.1：从 homework_check 配置组读取）
+        hw_cfg = self._get_config("homework_check", {}) or {}
+        warn_hours = hw_cfg.get(
             "homework_due_warn_hours", DEFAULT_HOMEWORK_DUE_WARN_HOURS
         )
         imminent = get_imminent_due(fresh, warn_hours)
@@ -338,7 +341,7 @@ class TronClassPlugin(Star):
         await client.close()
 
         # 如果有快到期作业，附带提醒
-        if imminent and self._get_config("enable_due_warning", True):
+        if imminent and hw_cfg.get("enable_due_warning", True):
             summary += "\n\n⚠️ **快到期提醒：**\n"
             for hw in imminent:
                 course = hw.get("course_name", "?")
@@ -520,19 +523,29 @@ class TronClassPlugin(Star):
         else:
             lines.append("📅 课表：❌ 未上传（点名检测将按默认间隔轮询）")
 
-        # ④ 通知开关
-        lines.append("🔔 通知开关：")
+        # ④ 功能总开关（v1.1：关闭后对应 cron 不注册、不检测不推送）
+        hw_cfg = self._get_config("homework_check", {}) or {}
+        rc_cfg = self._get_config("rollcall_check", {}) or {}
         lines.append(
-            f"  - 新作业：{'开' if self._get_config('enable_new_homework_notify', True) else '关'}"
+            f"🎛 作业检测(总开关)：{'开' if hw_cfg.get('enable_homework_check', True) else '关'}"
         )
         lines.append(
-            f"  - 快到期：{'开' if self._get_config('enable_due_warning', True) else '关'}"
-        )
-        lines.append(
-            f"  - 点名：{'开' if self._get_config('enable_rollcall_notify', True) else '关'}"
+            f"🎛 点名检测(总开关)：{'开' if rc_cfg.get('enable_rollcall_check', True) else '关'}"
         )
 
-        # ⑤ 推送失败计数
+        # ⑤ 通知开关（v1.1：从配置组读取）
+        lines.append("🔔 通知开关：")
+        lines.append(
+            f"  - 新作业：{'开' if hw_cfg.get('enable_new_homework_notify', True) else '关'}"
+        )
+        lines.append(
+            f"  - 快到期：{'开' if hw_cfg.get('enable_due_warning', True) else '关'}"
+        )
+        lines.append(
+            f"  - 点名：{'开' if rc_cfg.get('enable_rollcall_notify', True) else '关'}"
+        )
+
+        # ⑥ 推送失败计数
         fail = await self._storage.get_push_failure(user_id)
         if fail.get("count", 0) > 0:
             last = datetime.fromtimestamp(fail.get("last_failed_at", 0)).strftime(

@@ -42,6 +42,7 @@ BASE_URL = "https://courses.cuc.edu.cn"
 # ========== 默认值 ==========
 DEFAULT_HOMEWORK_CHECK_INTERVAL = 30   # 分钟
 DEFAULT_ROLLCALL_DEFAULT_INTERVAL = 5  # 分钟
+DEFAULT_ROLLCALL_IN_CLASS_INTERVAL = 1  # 分钟（有课表时上课时间内的点名检测间隔）
 DEFAULT_ROLLCALL_PRECHECK_MINUTES = 5  # 分钟
 DEFAULT_HOMEWORK_DUE_WARN_HOURS = 24   # 小时
 
